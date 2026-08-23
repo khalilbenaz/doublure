@@ -10,12 +10,12 @@ set -uo pipefail
 QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
 say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
-die() { printf 'claude-fallback: %s\n' "$*" >&2; exit 1; }
+die() { printf 'doublure: %s\n' "$*" >&2; exit 1; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC="$HERE/src"; [ -d "$SRC" ] || SRC="$HERE"
-DEST="$HOME/.claude-fallback"
-LABEL="com.claude-fallback.router"
+DEST="$HOME/.doublure"
+LABEL="com.doublure.router"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 # Un python explicite : le LaunchAgent n'a pas le PATH du shell, un
@@ -49,26 +49,26 @@ exit 0
 HOOK
 chmod +x "$DEST/hook.sh"
 
-# --- commande cfb --------------------------------------------------------
-cat > "$DEST/cfb" <<CFB
+# --- commande dbl --------------------------------------------------------
+cat > "$DEST/dbl" <<DBL
 #!/usr/bin/env bash
 exec "$PY" "$DEST/fallback.py" "\$@"
-CFB
-chmod +x "$DEST/cfb"
+DBL
+chmod +x "$DEST/dbl"
 # Un lien dans ~/.local/bin s'il existe deja : on ne cree pas un dossier de
 # PATH que l'utilisateur n'a pas voulu, il n'y serait probablement pas.
-if [ -d "$HOME/.local/bin" ] && [ ! -e "$HOME/.local/bin/cfb" ]; then
-  ln -s "$DEST/cfb" "$HOME/.local/bin/cfb" && say "cfb lie dans ~/.local/bin"
+if [ -d "$HOME/.local/bin" ] && [ ! -e "$HOME/.local/bin/dbl" ]; then
+  ln -s "$DEST/dbl" "$HOME/.local/bin/dbl" && say "dbl lie dans ~/.local/bin"
 fi
 
 # --- LaunchAgent ---------------------------------------------------------
 # Le port ne suit que s'il a ete choisi : sinon le plist reste sans surcharge
 # et le routeur prend son defaut, comme settings.json.
 PORT_ENV=""
-if [ -n "${CLAUDE_ROUTER_PORT:-}" ]; then
+if [ -n "${DOUBLURE_PORT:-}" ]; then
   PORT_ENV="
   <key>EnvironmentVariables</key>
-  <dict><key>CLAUDE_ROUTER_PORT</key><string>$CLAUDE_ROUTER_PORT</string></dict>"
+  <dict><key>DOUBLURE_PORT</key><string>$DOUBLURE_PORT</string></dict>"
 fi
 want=$(cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -113,14 +113,14 @@ say "$out"
 [ "$code" = 0 ] || { [ "$QUIET" = 1 ] && exit 0; die "$out"; }
 
 if [ "$QUIET" = 0 ]; then
-  if [ -L "$HOME/.local/bin/cfb" ]; then say ""; say "Installe. Commande : cfb"
-  else say ""; say "Installe. Commande : $DEST/cfb"; fi
+  if [ -L "$HOME/.local/bin/dbl" ]; then say ""; say "Installe. Commande : dbl"
+  else say ""; say "Installe. Commande : $DEST/dbl"; fi
   cat <<TXT
 
-  cfb                    etat courant
-  cfb on [zen|kilo|or]   forcer un repli
-  cfb off                revenir aux comptes Claude
-  cfb auto off           desarmer le repli automatique
+  dbl                    etat courant
+  dbl on [zen|kilo|or]   forcer un repli
+  dbl off                revenir aux comptes Claude
+  dbl auto off           desarmer le repli automatique
 
 Claude Code ne relit settings.json qu'au demarrage : relance tes sessions
 ouvertes une derniere fois. Ensuite le repli est automatique — quand ton

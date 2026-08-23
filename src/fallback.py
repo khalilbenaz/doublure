@@ -36,9 +36,9 @@ HOME = os.path.expanduser("~")
 SETTINGS = os.path.join(HOME, ".claude", "settings.json")
 # Tout ce que l'outil ecrit tient dans un seul dossier : le desinstaller, c'est
 # le supprimer, sans avoir a deviner ce qui a ete seme ailleurs.
-CFB_DIR = os.path.join(HOME, ".claude-fallback")
-STATE_FILE = os.path.join(CFB_DIR, "state.json")
-ENV_FILE = os.path.join(CFB_DIR, ".env")
+DBL_DIR = os.path.join(HOME, ".doublure")
+STATE_FILE = os.path.join(DBL_DIR, "state.json")
+ENV_FILE = os.path.join(DBL_DIR, ".env")
 # Emplacements des versions precedentes : lus, jamais ecrits, pour qu'une
 # installation existante ne perde ni sa cle ni son mode courant.
 LEGACY_ENV = (os.path.join(HOME, ".fcc", ".env"),)
@@ -52,11 +52,11 @@ FCC_BASE = OR_BASE
 # qu'au demarrage, l'y ecrire ne suffisait pas.
 # Le port n'a de raison de changer qu'en test, ou une seconde installation
 # ne doit pas se battre avec celle de la machine pour le meme port.
-ROUTER_PORT = os.environ.get("CLAUDE_ROUTER_PORT", "8099")
+ROUTER_PORT = os.environ.get("DOUBLURE_PORT", "8099")
 ROUTER_BASE = f"http://127.0.0.1:{ROUTER_PORT}"
-ROUTER_LABEL = "com.claude-fallback.router"
-ROUTER_PY = os.path.join(CFB_DIR, "router.py")
-HOOK_SH = os.path.join(CFB_DIR, "hook.sh")
+ROUTER_LABEL = "com.doublure.router"
+ROUTER_PY = os.path.join(DBL_DIR, "router.py")
+HOOK_SH = os.path.join(DBL_DIR, "hook.sh")
 
 # Le repli reste arme ce temps-la avant de retenter Anthropic, quand l'amont
 # n'a pas dit lui-meme quand le quota repart.
@@ -133,7 +133,7 @@ def proxy_env():
         "ANTHROPIC_BASE_URL": ROUTER_BASE,
         # Le routeur remplace cette valeur par le vrai jeton du compte actif ;
         # elle n'est la que parce que Claude Code exige un identifiant.
-        "ANTHROPIC_AUTH_TOKEN": "claude-fallback",
+        "ANTHROPIC_AUTH_TOKEN": "doublure",
         # Le routeur est en loopback : jamais via un proxy HTTP d'entreprise.
         "NO_PROXY": "127.0.0.1,localhost,::1",
         "no_proxy": "127.0.0.1,localhost,::1",
@@ -166,8 +166,8 @@ def start_router(wait=10):
             return True, "routeur demarre"
         time.sleep(1)
     if os.path.exists(ROUTER_PY):
-        os.makedirs(CFB_DIR, exist_ok=True)
-        log = open(os.path.join(CFB_DIR, "router.log"), "a")
+        os.makedirs(DBL_DIR, exist_ok=True)
+        log = open(os.path.join(DBL_DIR, "router.log"), "a")
         subprocess.Popen([sys.executable, ROUTER_PY],
                          stdout=log, stderr=subprocess.STDOUT,
                          start_new_session=True)
@@ -299,7 +299,7 @@ CHAIN = ("zen", "kilo", "or")
 # l'on ne garde que ce qui est gratuit, avec un cache disque pour ne pas
 # payer un aller-retour reseau a chaque affichage du dashboard.
 
-FREE_CACHE = os.path.join(CFB_DIR, "free-models.json")
+FREE_CACHE = os.path.join(DBL_DIR, "free-models.json")
 FREE_TTL = 6 * 3600
 
 # Repli si la passerelle ne repond pas : les modeles valides a la main.
@@ -463,7 +463,7 @@ def reset_models(pid):
 
 # Cloudflare refuse « Python-urllib » devant Zen : sans agent explicite, la
 # sonde revient en 403 sans rapport avec la disponibilite du service.
-UA = "claude-router/1.0"
+UA = "doublure/1.0"
 
 
 def chain():
@@ -544,7 +544,7 @@ def check(pid, timeout=25):
     if pid == "or":
         key = or_key()
         if not key:
-            return False, "OPENROUTER_API_KEY absente de ~/.claude-fallback/.env"
+            return False, "OPENROUTER_API_KEY absente de ~/.doublure/.env"
         req = urllib.request.Request(
             f"{OR_BASE}/key", headers={"Authorization": f"Bearer {key}",
                                        "User-Agent": UA})

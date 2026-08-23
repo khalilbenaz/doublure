@@ -44,15 +44,15 @@ import urllib.parse
 import urllib.request
 
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("CLAUDE_ROUTER_PORT", "8099"))
+PORT = int(os.environ.get("DOUBLURE_PORT", "8099"))
 
 HOME = os.path.expanduser("~")
 # Le pont vit a cote de ce fichier, ou qu'on l'ait installe.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge  # noqa: E402  (le chemin doit etre pose avant l'import)
 
-CFB_DIR = os.path.join(HOME, ".claude-fallback")
-STATE = os.path.join(CFB_DIR, "state.json")
+DBL_DIR = os.path.join(HOME, ".doublure")
+STATE = os.path.join(DBL_DIR, "state.json")
 # Etats des versions precedentes : lus en secours, jamais ecrits.
 LEGACY_STATE = (os.path.join(HOME, ".claude", "fcc-fallback.json"),
                 os.path.join(HOME, ".claude-swap-backup", "fallback.json"))
@@ -62,7 +62,7 @@ UPSTREAM_OR = ("openrouter.ai", 443, True)
 
 # OpenRouter sert l'API Anthropic sous /api/v1 ; Claude Code appelle /v1.
 OR_PREFIX = "/api"
-ENV_FILE = os.path.join(CFB_DIR, ".env")
+ENV_FILE = os.path.join(DBL_DIR, ".env")
 LEGACY_ENV = (os.path.join(HOME, ".fcc", ".env"),)
 
 # Reecriture obligatoire du nom de modele : laisse tel quel, « claude-opus-5 »
@@ -125,13 +125,13 @@ RETRY_NATIVE_DEFAULT = 30 * 60
 
 # Cloudflare refuse « Python-urllib » en amont : un agent explicite evite un
 # 403 qui n'a rien a voir avec la requete elle-meme.
-BRIDGE_UA = "claude-fallback/1.0"
+BRIDGE_UA = "doublure/1.0"
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 # L'identifiant client OAuth de Claude Code n'est PAS ecrit en dur ici :
 # c'est celui de l'installation de l'utilisateur, retrouve sur sa machine
 # par client_id(). Le distribuer serait partager le notre.
-CLIENT_ID_FILE = os.path.join(CFB_DIR, "client-id")
+CLIENT_ID_FILE = os.path.join(DBL_DIR, "client-id")
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 # On rafraichit avant l'echeance : une requete ne doit jamais partir avec un
 # jeton qui expire pendant son vol.
@@ -205,7 +205,7 @@ def set_mode(mode, reason, retry_at=0):
     data = read_state()
     data.update(mode=mode, since=int(time.time()), reason=reason,
                 retryNativeAt=int(retry_at))
-    os.makedirs(CFB_DIR, exist_ok=True)
+    os.makedirs(DBL_DIR, exist_ok=True)
     tmp = STATE + ".tmp"
     try:
         with open(tmp, "w") as fh:
@@ -346,7 +346,7 @@ def client_id():
     """Identifiant client OAuth, pris sur l'installation locale de Claude Code.
 
     Rien n'est ecrit en dur : la valeur appartient a l'utilisateur, pas au
-    depot. Elle est mise en cache dans ~/.claude-fallback/client-id — relire
+    depot. Elle est mise en cache dans ~/.doublure/client-id — relire
     onze mega-octets a chaque rafraichissement de jeton serait absurde.
     """
     forced = (os.environ.get("CLAUDE_OAUTH_CLIENT_ID") or "").strip()
@@ -364,7 +364,7 @@ def client_id():
         found = _scan_client_id()
         if found:
             try:
-                os.makedirs(CFB_DIR, exist_ok=True)
+                os.makedirs(DBL_DIR, exist_ok=True)
                 tmp = CLIENT_ID_FILE + ".tmp"
                 with open(tmp, "w") as fh:
                     fh.write(found + "\n")
@@ -418,7 +418,7 @@ def refresh_token(refresh):
     req = urllib.request.Request(
         OAUTH_TOKEN_URL, data=payload, method="POST",
         headers={"Content-Type": "application/json",
-                 "User-Agent": "claude-router/1.0"})
+                 "User-Agent": "doublure/1.0"})
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode())
 
@@ -857,7 +857,7 @@ class Router(http.server.BaseHTTPRequestHandler):
                 self.local(503, {"type": "error", "error": {
                     "type": "router_error",
                     "message": "OPENROUTER_API_KEY introuvable dans "
-                               "~/.claude-fallback/.env — repli impossible."}})
+                               "~/.doublure/.env — repli impossible."}})
                 return None
             headers.pop("x-api-key", None)
             headers.pop("X-Api-Key", None)

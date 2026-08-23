@@ -1,114 +1,123 @@
-# claude-fallback
+# Doublure
 
-Quand le quota de Claude Code est atteint, la session s'arrête net jusqu'à la
-reprise de la fenêtre. `claude-fallback` lui donne un plan B : la requête qui
-vient de se faire refuser **repart aussitôt vers un modèle gratuit**, et le
-travail continue. Rien à relancer, aucun message perdu.
+**La doublure de Claude Code.** Elle entre en scène quand la vedette ne peut
+plus jouer — et la salle ne s'en aperçoit pas.
 
-Le retour aux comptes Claude est automatique dès que la fenêtre de quota
-annoncée par Anthropic est écoulée.
+Quand la fenêtre de quota Claude est pleine, Claude Code s'arrête net : il n'a
+pas de plan B. Doublure lui en donne un. Le `429` d'Anthropic est intercepté
+*avant* qu'un seul octet ne soit parti vers ton terminal, l'amont bascule sur
+un modèle gratuit, et **la même requête repart aussitôt**. Tu ne perds pas ton
+message, tu ne relances rien, tu ne redémarres pas ta session.
+
+```
+  toi ─── claude ───► routeur local ──┬──► api.anthropic.com      (ton compte)
+                       127.0.0.1:8099 │
+                                       └──► zen / kilo / openrouter (gratuit)
+                                            ▲
+                                            └─ bascule ici, en vol, sur 429
+```
+
+- **Zéro configuration.** Deux des trois passerelles ne demandent aucune clé.
+- **Bascule à chaud.** Une session ouverte depuis six heures suit, sans
+  redémarrer.
+- **Auto-réparante.** Un hook `SessionStart` vérifie le montage à chaque
+  lancement de `claude` et le répare tout seul.
+- **Rien à toi ne sort de la machine.** Voir [Sécurité](docs/SECURITE.md).
+
+## Installation
 
 ```bash
-git clone https://github.com/<toi>/claude-fallback && cd claude-fallback
+git clone https://github.com/khalilbenaz/doublure
+cd doublure
 ./install.sh
 ```
 
-Claude Code ne lit `settings.json` qu'au démarrage de session : après la
-première installation, relance tes sessions ouvertes. Ensuite, plus rien à
-faire — l'installation se vérifie elle-même à chaque lancement de `claude`.
+macOS, `python3 >= 3.9`, rien d'autre — aucune dépendance à installer.
 
-## Comment ça marche
+Relance tes sessions Claude Code ouvertes une dernière fois : `settings.json`
+n'est relu qu'au démarrage. Ensuite, plus jamais.
 
-`settings.json` pointe une fois pour toutes sur un routeur local
-(`127.0.0.1:8099`) au lieu de `api.anthropic.com`. Le routeur décide **à chaque
-requête** où l'envoyer :
-
-| mode | amont | clé requise |
-|---|---|---|
-| `native` | `api.anthropic.com`, avec ton jeton OAuth Claude Code | — |
-| `zen` | opencode Zen | non |
-| `kilo` | Kilo | non |
-| `or` | OpenRouter (parle l'API Anthropic nativement) | `OPENROUTER_API_KEY` |
-
-Pourquoi un routeur plutôt qu'une réécriture de `settings.json` : ce fichier
-n'est relu qu'au démarrage de session. Y écrire le repli ne l'appliquerait qu'à
-la session *suivante* — inutile à l'instant précis où le quota tombe. Le mode
-vit donc dans un fichier d'état relu à chaud : une session ouverte depuis des
-heures bascule sans redémarrer.
-
-Le nom du modèle est **toujours** réécrit vers un modèle gratuit. Laissé tel
-quel, `claude-opus-5` serait servi par OpenRouter depuis le vrai Anthropic et
-facturé au crédit : le repli doit rester gratuit.
+```bash
+./uninstall.sh    # retire tout, y compris ce qui a été posé dans settings.json
+```
 
 ## Utilisation
 
+Le plus souvent : rien. Le repli est automatique. Quand tu veux regarder ou
+forcer la main :
+
 ```bash
-cfb                    # état courant
-cfb on                 # forcer le repli (premier fournisseur joignable)
-cfb on kilo            # forcer un fournisseur précis
-cfb off                # revenir aux comptes Claude
-cfb auto off           # désarmer le repli automatique
-cfb models             # modèles servis par chaque fournisseur
-cfb probe              # re-sonder les catalogues gratuits
-cfb json               # état complet, pour un dashboard
+dbl                    # état courant
+dbl on                 # forcer le repli (premier fournisseur joignable)
+dbl on kilo            # forcer un fournisseur précis
+dbl off                # revenir aux comptes Claude
+dbl auto off           # désarmer le repli automatique
+dbl models             # modèles servis par chaque fournisseur
+dbl probe              # re-sonder les catalogues gratuits
+dbl json               # état complet en JSON, pour un tableau de bord
+```
+
+Sortie typique :
+
+```
+mode    repli zen (opencode Zen)
+        opus    nemotron-3-ultra-free
+        sonnet  nemotron-3-ultra-free
+        fable   nemotron-3.5-lightning-free
+        haiku   nemotron-3.5-lightning-free
+auto    arme
+raison  auto: quota Claude atteint
+natif   retente dans 24 min
+routeur en ligne (http://127.0.0.1:8099)
 ```
 
 Un repli pris **à la main** n'est jamais défait tout seul : seul un repli
-automatique s'annule au retour du quota, sinon l'outil contredirait un choix
-explicite.
+automatique s'annule au retour du quota. Contredire un choix explicite serait
+pire que de rester sur un modèle plus faible.
 
-## OpenRouter (facultatif)
+## Les trois passerelles
 
-Les deux premières passerelles ne demandent aucune clé. OpenRouter est le seul
-amont à parler l'API Anthropic nativement, mais son palier gratuit est plafonné
-à 50 requêtes par jour. Pour l'activer :
+| Ordre | Fournisseur | Clé | Plafond | Particularité |
+|---|---|---|---|---|
+| 1 | **opencode Zen** | non | aucun constaté | API OpenAI, traduite |
+| 2 | **Kilo** | non | aucun constaté | API OpenAI, catalogue plus large |
+| 3 | **OpenRouter** | oui | 50 req/jour (gratuit) | seul à parler l'API Anthropic |
 
-```bash
-echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.claude-fallback/.env
-```
+Les deux sans plafond passent d'abord. OpenRouter est le seul à comprendre
+`/v1/messages` nativement — donc le plus fidèle — mais son palier gratuit
+s'épuise en une session de travail, d'où sa dernière place. Sans clé, il quitte
+la chaîne : le tenter donnerait un `401` présenté comme une panne du repli
+alors que les autres auraient répondu.
 
-Sans clé, il est simplement retiré de la chaîne d'essai — le tenter donnerait
-un 401 présenté comme une panne du repli alors que les autres auraient répondu.
-
-## Ce qui est installé
-
-```
-~/.claude-fallback/          router.py, bridge.py, fallback.py, cfb, état, logs
-                             client-id : ton identifiant client OAuth, lu
-                             dans ta propre installation de Claude Code
-~/Library/LaunchAgents/com.claude-fallback.router.plist
-~/.claude/settings.json      env → routeur, + un hook SessionStart
-```
-
-Le hook SessionStart rejoue `install.sh --quiet` : il répare l'`env`, recharge
-le LaunchAgent et redémarre le routeur s'il manque. C'est ce qui rend
-l'installation auto-réparante sans jamais bloquer le lancement de `claude`.
+Pour l'activer :
 
 ```bash
-./uninstall.sh    # retire tout, y compris les clés posées dans settings.json
+echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.doublure/.env
 ```
 
-## Ce qui ne sort jamais de la machine
+## Documentation
 
-Aucun identifiant n'est embarqué dans ce dépôt.
-
-- **Jeton du compte Claude** : lu à la demande dans le trousseau macOS
-  (`Claude Code-credentials`), rafraîchi sur place, jamais copié ailleurs.
-- **Identifiant client OAuth** : extrait de *ta* propre installation de Claude
-  Code au moment de l'installation, puis mis en cache dans
-  `~/.claude-fallback/client-id`. Il est le même pour tout le monde, mais c'est
-  à chacun de le prendre chez soi. `CLAUDE_OAUTH_CLIENT_ID` le surcharge.
-- **Clé OpenRouter** : dans `~/.claude-fallback/.env`, hors dépôt.
+| | |
+|---|---|
+| [Architecture](docs/ARCHITECTURE.md) | Pourquoi un routeur, le chemin d'une requête, la reprise sur `429`, la traduction d'API |
+| [Configuration](docs/CONFIGURATION.md) | Toutes les variables, toutes les clés d'état, changer de modèle ou d'ordre |
+| [Dépannage](docs/DEPANNAGE.md) | Symptôme → cause → correctif, et où lire les journaux |
+| [Sécurité](docs/SECURITE.md) | Ce qui ne quitte jamais la machine, et pourquoi |
 
 ## Limites
 
-- **macOS uniquement** : le jeton du mode natif vient du trousseau et le
-  service est un LaunchAgent. Un portage Linux/systemd est possible, pas fait.
-- Les modèles gratuits sont nettement moins bons qu'Opus ou Sonnet. C'est un
-  filet, pas un remplacement.
-- Le repli n'est pris que si Anthropic répond `429` **avant** le premier octet
-  de la réponse. Un quota atteint au milieu d'un flux SSE remonte l'erreur
-  telle quelle : rejouer aurait dupliqué une réponse déjà commencée.
-- Les passerelles gratuites ne servent que `/v1/messages` (et le comptage de
-  jetons, estimé localement). Le reste de l'API Anthropic répond `404` en mode
-  repli.
+- **macOS uniquement.** Le jeton du mode natif vient du trousseau et le service
+  est un LaunchAgent. Un portage Linux/systemd est possible, pas fait.
+- **Les modèles gratuits sont nettement moins bons** qu'Opus ou Sonnet. C'est
+  un filet, pas un remplacement. On y finit une tâche, on n'y commence pas une
+  refonte.
+- **Le repli n'est pris que si le `429` arrive avant le premier octet** de la
+  réponse. Un quota atteint au milieu d'un flux remonte l'erreur telle quelle :
+  rejouer aurait dupliqué une réponse déjà commencée.
+- **Les passerelles gratuites ne servent que `/v1/messages`** (et le comptage
+  de jetons, estimé localement). Le reste de l'API Anthropic répond `404` en
+  mode repli.
+
+## Licence
+
+MIT — voir [LICENSE](LICENSE).

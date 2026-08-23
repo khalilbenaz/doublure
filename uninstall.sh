@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Retire le repli : LaunchAgent, hook, cles env, et le dossier d'etat.
 set -uo pipefail
-DEST="$HOME/.claude-fallback"
-LABEL="com.claude-fallback.router"
+DEST="$HOME/.doublure"
+LABEL="com.doublure.router"
 PY=$(command -v python3) || PY=python3
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
