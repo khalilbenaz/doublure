@@ -295,9 +295,22 @@ def watchdog():
             if not str(st.get("reason", "")).startswith("auto"):
                 continue
             due = st.get("retryNativeAt") or 0
-            if due and time.time() >= due:
-                set_mode("native", "auto: fenetre de quota supposee repartie")
-                log("retour au natif (fenetre de quota ecoulee)")
+            if not due or time.time() < due:
+                continue
+
+            # La date est atteinte. Avant de rebasculer, confirmer avec le
+            # dernier releve de quota : une date de retour optimiste renverrait
+            # au natif pour reprendre un 429 et retomber en repli — un
+            # aller-retour perdu, et une requete client qui l'attend.
+            later = quota_still_full()
+            if later:
+                set_mode(st.get("mode"), st.get("reason") or "auto", later)
+                log(f"quota toujours annonce plein — retour au natif repousse "
+                    f"de {max(1, round((later - time.time()) / 60))} min")
+                continue
+
+            set_mode("native", "auto: fenetre de quota supposee repartie")
+            log("retour au natif (fenetre de quota ecoulee)")
         except Exception as e:                      # un thread de fond ne meurt pas
             log(f"watchdog: {type(e).__name__}")
 
@@ -710,6 +723,34 @@ def usage_verdict(data):
             worst = (pct, until, name)
     pct, until, name = worst
     return pct >= USAGE_THRESHOLD, until, name, pct
+
+
+def quota_still_full():
+    """Date de retour a retenir si TOUS les comptes sont encore annonces
+    epuises ; None des qu'un seul est utilisable ou inconnu.
+
+    Le doute profite au retour au natif : sans releve — routeur qui vient de
+    demarrer, sonde en panne, endpoint modifie — on rend None. Retenir un
+    compte valide en repli gratuit sur un silence serait le pire des deux
+    mondes ; au pire on reprend un 429, qui sait se rattraper tout seul.
+    """
+    now = time.time()
+    soonest = None
+    for acc in all_accounts():
+        data = usage_snapshot(acc["service"])
+        if data is None:
+            return None
+        spent, until, _, _ = usage_verdict(data)
+        if not spent:
+            return None
+        if until:
+            soonest = until if soonest is None else min(soonest, until)
+    if soonest is None and not all_accounts():
+        return None
+    # Plancher : une date de remise a zero deja passee alors que le compte est
+    # toujours donne plein ferait repousser a chaque tour de garde, une ligne
+    # de journal par minute pour rien.
+    return max(soonest or 0, now + 5 * 60)
 
 
 def usage_watch():

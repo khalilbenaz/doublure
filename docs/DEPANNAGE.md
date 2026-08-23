@@ -60,8 +60,23 @@ Si elle vaut `manuel`, c'est voulu : un repli pris à la main n'est jamais défa
 tout seul. `dbl off` pour revenir.
 
 Si elle commence par `auto`, le chien de garde attend `retryNativeAt`. La ligne
-`natif retente dans N min` de `dbl` donne l'échéance. Elle vient de l'en-tête
-d'Anthropic, ou vaut 30 minutes par défaut.
+`natif retente dans N min` de `dbl` donne l'échéance. Elle vient de la date de
+remise à zéro annoncée par Anthropic, de l'en-tête `retry-after` d'un `429`, ou
+vaut 30 minutes par défaut.
+
+**L'échéance peut être repoussée.** Passé la date, le chien de garde vérifie le
+dernier relevé de quota : si tous les comptes sont encore annoncés pleins, il
+reporte au lieu de rebasculer pour rien. Le journal le dit :
+
+```bash
+grep "repousse" ~/.doublure/router.log | tail -3
+```
+
+Si tu veux revenir tout de suite sans attendre cette confirmation :
+
+```bash
+dbl off
+```
 
 ### Un compte ajouté n'est jamais utilisé
 

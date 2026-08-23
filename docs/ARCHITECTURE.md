@@ -189,7 +189,23 @@ Un thread de fond, toutes les 60 secondes :
 - si le mode est `native`, il n'a rien à faire ;
 - si la raison ne commence pas par `"auto"`, il ne touche à rien — **un repli
   manuel n'est jamais défait** ;
-- sinon, passé `retryNativeAt`, il repasse en natif.
+- passé `retryNativeAt`, il demande confirmation au dernier relevé de quota
+  (`quota_still_full()`) avant de rebasculer ;
+- si tous les comptes sont *encore* annoncés pleins, il repousse la date au
+  lieu de repasser en natif ;
+- sinon, il repasse en natif.
+
+La confirmation évite un aller-retour perdu : une date de retour optimiste
+renverrait au natif juste pour y reprendre un `429` et retomber en repli — avec
+une requête client qui attend pendant ce temps. Le doute, lui, profite au
+retour : sans relevé (routeur qui vient de démarrer, sonde en panne, endpoint
+modifié), `quota_still_full()` rend `None` et la bascule se fait. Retenir un
+compte valide en repli gratuit sur un silence serait le pire des deux mondes ;
+au pire on reprend un `429`, qui sait se rattraper tout seul.
+
+Le report a un plancher de cinq minutes. Sans lui, une date de remise à zéro
+déjà passée alors que le compte est toujours donné plein ferait repousser à
+chaque tour — une ligne de journal par minute pour rien.
 
 Il attrape `Exception` largement et journalise : un thread de fond qui meurt
 laisserait le repli armé pour toujours, en silence.

@@ -30,8 +30,10 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
 - **Plusieurs comptes Claude.** Rotation automatique, le compte épuisé se met
   au repos, un vrai Opus avant tout modèle gratuit.
 - **Zéro configuration.** Deux des trois passerelles ne demandent aucune clé.
-- **Bascule à chaud.** Une session ouverte depuis six heures suit, sans
-  redémarrer — changer de compte ne demande ni relogin ni nouvelle session.
+- **Bascule à chaud, dans les deux sens.** Une session ouverte depuis six
+  heures suit, sans redémarrer — changer de compte ne demande ni relogin ni
+  nouvelle session. Quand le quota revient, le retour sur Claude est
+  automatique, et confirmé par le relevé avant d'être pris.
 - **Auto-réparante.** Un hook `SessionStart` vérifie le montage à chaque
   lancement de `claude` et le répare tout seul.
 - **Rien à toi ne sort de la machine.** Voir [Sécurité](docs/SECURITE.md).

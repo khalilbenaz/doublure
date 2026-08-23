@@ -35,7 +35,7 @@ main marche, mais `dbl` est plus sûr.
 | `since` | époque | Depuis quand ce mode. |
 | `reason` | texte | Pourquoi. Commence par `"auto"` si c'est le dispositif qui a décidé — **c'est ce préfixe qui autorise le chien de garde à défaire la bascule**. `"manuel"` est intouchable. |
 | `lastError` | texte | Dernier échec rencontré, pour affichage. |
-| `retryNativeAt` | époque | À partir de quand retenter Anthropic. `0` = jamais programmé. |
+| `retryNativeAt` | époque | À partir de quand retenter Anthropic. `0` = jamais programmé. Passé cette date, le retour n'a lieu que si le relevé de quota le confirme ; sinon elle est repoussée. |
 | `chain` | liste | Ordre d'essai des fournisseurs. Absent = `["zen", "kilo", "or"]`. |
 | `models` | objet | Surcharges de modèles, par fournisseur (voir plus bas). |
 | `account` | texte | Compte Claude à utiliser. Absent ou `null` = rotation automatique. Un compte au repos est sauté même s'il est nommé ici. |
