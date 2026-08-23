@@ -15,6 +15,7 @@ défaut.
 
 ```
 ~/.doublure/state.json     mode courant, ordre des fournisseurs, surcharges
+~/.doublure/accounts.json  comptes Claude : nom, service trousseau, repos
 ~/.doublure/.env           OPENROUTER_API_KEY=sk-or-...
 ~/.doublure/client-id      identifiant client OAuth mis en cache
 ~/.doublure/free-models.json   catalogue des modèles gratuits (cache 6 h)
@@ -37,6 +38,56 @@ main marche, mais `dbl` est plus sûr.
 | `retryNativeAt` | époque | À partir de quand retenter Anthropic. `0` = jamais programmé. |
 | `chain` | liste | Ordre d'essai des fournisseurs. Absent = `["zen", "kilo", "or"]`. |
 | `models` | objet | Surcharges de modèles, par fournisseur (voir plus bas). |
+| `account` | texte | Compte Claude à utiliser. Absent ou `null` = rotation automatique. Un compte au repos est sauté même s'il est nommé ici. |
+
+## `accounts.json`
+
+Écrit par `dbl accounts`, relu par le routeur à chaque requête. **Aucun secret
+n'y figure** : seulement le nom, le service de trousseau correspondant, et la
+date de fin de repos.
+
+```json
+{
+ "accounts": [
+  {"name": "claude", "service": "Claude Code-credentials", "cooldownUntil": 1787527572},
+  {"name": "perso",  "service": "Doublure-perso",          "cooldownUntil": 0}
+ ]
+}
+```
+
+| Clé | Sens |
+|---|---|
+| `name` | Ce que tu tapes dans `dbl accounts use <nom>`. Lettres, chiffres, `.`, `_`, `-`, 32 caractères max. |
+| `service` | Service du trousseau macOS où vit le jeton. `Doublure-<nom>` pour les comptes ajoutés ; `Claude Code-credentials` pour celui de la session. |
+| `cooldownUntil` | Époque jusqu'à laquelle le compte est sauté, posée sur un `429` d'après ce qu'Anthropic annonce. `0` = disponible. |
+
+Le compte nommé `claude` existe toujours, même absent du fichier : c'est
+l'entrée que Claude Code gère lui-même. Le routeur la **lit** et n'y écrit que
+pour le rafraîchissement de son propre jeton — exactement ce que Claude Code
+ferait.
+
+Effacer le fichier ne casse rien : on retombe sur le seul compte de la session,
+et les copies restent dans le trousseau (à retirer avec `security
+delete-generic-password -s Doublure-<nom>`, ou en les réenregistrant puis
+`dbl accounts rm`).
+
+## Ajouter, retirer, forcer un compte
+
+```bash
+dbl accounts                 # liste, l'étoile marque celui qui sert
+dbl accounts add <nom>       # enregistre le compte connecté maintenant
+dbl accounts rm <nom>        # retire, trousseau compris
+dbl accounts use <nom>       # force ce compte, dès la requête suivante
+dbl accounts use auto        # rend la main à la rotation
+```
+
+`add` copie l'entrée de trousseau **actuelle** : c'est donc `claude` puis
+`/login` avec l'autre compte, puis `dbl accounts add <nom>`. Aucun OAuth n'est
+rejoué.
+
+`use` ne survit pas au repos : si le compte forcé rend un `429`, il est mis au
+repos et la rotation reprend. Pour rester sur un compte coûte que coûte, il n'y
+a rien — et c'est volontaire : refuser de servir une requête serait pire.
 
 ## Changer l'ordre des fournisseurs
 

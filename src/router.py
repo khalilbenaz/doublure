@@ -9,14 +9,19 @@ La solution : `settings.json` pointe une fois pour toutes sur ce routeur, qui
 decide *a chaque requete* ou l'envoyer :
 
   mode natif    -> https://api.anthropic.com, avec le jeton OAuth du compte
-                   connecte (lu dans le trousseau macOS de Claude Code)
+                   actif (lu dans le trousseau macOS de Claude Code)
   mode zen/kilo -> passerelles OpenAI-compatibles, traduites par `bridge.py`
   mode or       -> https://openrouter.ai/api/v1, seul amont a parler l'API
                    Anthropic nativement (/v1/messages, SSE, tool_use)
 
+Plusieurs comptes Claude peuvent etre enregistres : sur un 429, le routeur
+essaie d'abord le compte suivant qui n'est pas en repos, et ce n'est qu'une
+fois tous les comptes epuises qu'il passe aux passerelles gratuites. Le compte
+utilise est choisi requete par requete, sans toucher a la session en cours.
+
 Le repli se prend tout seul : un 429 d'Anthropic est intercepte *avant* qu'un
 octet ne soit parti vers le client, l'etat bascule, et la meme requete repart
-par la passerelle gratuite. L'utilisateur ne perd pas son message et n'a rien
+par le compte suivant ou par la passerelle gratuite. L'utilisateur ne perd pas son message et n'a rien
 a relancer. Un chien de garde revient au natif quand la fenetre de quota
 annoncee par l'amont est ecoulee.
 
@@ -128,6 +133,15 @@ RETRY_NATIVE_DEFAULT = 30 * 60
 BRIDGE_UA = "doublure/1.0"
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+# Comptes Claude supplementaires. Le fichier ne contient que des metadonnees
+# (nom, repos en cours) : chaque jeton reste dans le trousseau, sous son propre
+# service « Doublure-<nom> ». Rien de secret n'atterrit sur le disque.
+ACCOUNTS_FILE = os.path.join(DBL_DIR, "accounts.json")
+KEYCHAIN_PREFIX = "Doublure-"
+# Repos par defaut d'un compte qui vient de rendre un 429 sans dire quand
+# revenir. Plus court que RETRY_NATIVE_DEFAULT : reessayer un compte ne coute
+# qu'une requete, alors que rester en repli gratuit coute en qualite.
+ACCOUNT_COOLDOWN_DEFAULT = 15 * 60
 # L'identifiant client OAuth de Claude Code n'est PAS ecrit en dur ici :
 # c'est celui de l'installation de l'utilisateur, retrouve sur sa machine
 # par client_id(). Le distribuer serait partager le notre.
@@ -147,7 +161,8 @@ STATE_TTL = 1.0          # le mode est relu au plus une fois par seconde
 _state_cache = {"at": 0.0, "mode": "native"}
 _state_lock = threading.Lock()
 
-_token_cache = {"at": 0.0, "token": None, "expires": 0}
+# Indexe par service de trousseau : deux comptes ne partagent pas un cache.
+_token_cache = {}
 _token_lock = threading.Lock()
 _cid_cache = {"id": ""}
 _cid_lock = threading.Lock()
@@ -376,10 +391,10 @@ def client_id():
     return found
 
 
-def read_keychain():
+def read_keychain(service=KEYCHAIN_SERVICE):
     try:
         out = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            ["security", "find-generic-password", "-s", service, "-w"],
             capture_output=True, text=True, timeout=10)
     except Exception:
         return None
@@ -391,15 +406,146 @@ def read_keychain():
         return None
 
 
-def write_keychain(blob):
+def write_keychain(blob, service=KEYCHAIN_SERVICE):
     """Reecrit l'entree du trousseau (-U remplace celle qui existe)."""
     try:
         subprocess.run(
-            ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE,
+            ["security", "add-generic-password", "-U", "-s", service,
              "-a", os.environ.get("USER", "claude"), "-w", json.dumps(blob)],
             capture_output=True, text=True, timeout=10)
     except Exception as e:
         log(f"trousseau non reecrit : {type(e).__name__}")
+
+
+# --------------------------------------------------------------------------
+# Plusieurs comptes Claude — rotation avant de tomber sur le gratuit
+# --------------------------------------------------------------------------
+# Le compte de la session Claude Code est toujours la, sous le nom « claude » :
+# c'est l'entree que Claude Code gere lui-meme, on ne fait que la lire. Les
+# autres sont des copies posees par `dbl accounts add`, chacune dans son propre
+# service de trousseau. Le routeur choisit le compte a chaque requete, donc
+# changer de compte ne demande ni relogin ni redemarrage de session.
+
+def read_accounts():
+    """Metadonnees des comptes, dans l'ordre d'essai."""
+    try:
+        with open(ACCOUNTS_FILE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    out = []
+    for item in data.get("accounts") or ():
+        if isinstance(item, dict) and item.get("name"):
+            out.append({"name": str(item["name"]),
+                        "service": item.get("service")
+                        or KEYCHAIN_PREFIX + str(item["name"]),
+                        "cooldownUntil": float(item.get("cooldownUntil") or 0)})
+    return out
+
+
+def write_accounts(accounts):
+    os.makedirs(DBL_DIR, exist_ok=True)
+    tmp = ACCOUNTS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"accounts": accounts}, fh, indent=1, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, ACCOUNTS_FILE)
+    except OSError as e:
+        log(f"comptes non ecrits ({type(e).__name__})")
+
+
+def all_accounts():
+    """Le compte de la session, puis ceux enregistres — sans doublon.
+
+    Le premier est toujours celui auquel Claude Code est connecte : c'est le
+    comportement d'origine quand aucun compte n'a ete ajoute.
+    """
+    session = {"name": "claude", "service": KEYCHAIN_SERVICE,
+               "cooldownUntil": 0}
+    out = [session]
+    seen = {KEYCHAIN_SERVICE}
+    for acc in read_accounts():
+        if acc["service"] in seen:
+            # Le compte de la session a lui aussi un repos memorise : le
+            # perdre ici le ferait reessayer en boucle sur son 429.
+            if acc["service"] == KEYCHAIN_SERVICE:
+                session["cooldownUntil"] = acc["cooldownUntil"]
+            continue
+        seen.add(acc["service"])
+        out.append(acc)
+    return out
+
+
+def active_account():
+    """Compte a utiliser maintenant : celui de l'etat, sinon le premier libre.
+
+    Un compte marque en repos est saute. Si tous le sont, on rend quand meme
+    le premier : c'est a l'appelant de decider du repli, pas a cette fonction
+    de refuser une requete que le quota a peut-etre deja laisse repasser.
+    """
+    accounts = all_accounts()
+    by_name = {a["name"]: a for a in accounts}
+    want = read_state().get("account")
+    now = time.time()
+    if want and want in by_name and by_name[want]["cooldownUntil"] <= now:
+        return by_name[want]
+    for acc in accounts:
+        if acc["cooldownUntil"] <= now:
+            return acc
+    return accounts[0]
+
+
+def set_active_account(name):
+    """Note dans l'etat le compte a utiliser. Relu a chaud comme le mode."""
+    data = read_state()
+    data["account"] = name
+    os.makedirs(DBL_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=1, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, STATE)
+    except OSError as e:
+        log(f"etat non ecrit ({type(e).__name__})")
+
+
+def rest_account(name, until):
+    """Met un compte au repos jusqu'a `until`.
+
+    Le compte de la session n'echappe pas a la regle : son repos est garde
+    dans le meme fichier, meme s'il n'a pas d'entree propre au depart.
+    """
+    accounts = read_accounts()
+    for acc in accounts:
+        if acc["name"] == name:
+            acc["cooldownUntil"] = float(until)
+            break
+    else:
+        accounts.insert(0, {"name": name,
+                            "service": KEYCHAIN_SERVICE if name == "claude"
+                            else KEYCHAIN_PREFIX + name,
+                            "cooldownUntil": float(until)})
+    write_accounts(accounts)
+
+
+def next_account(exclude, now=None):
+    """Prochain compte utilisable, en sautant ceux au repos et `exclude`."""
+    now = time.time() if now is None else now
+    for acc in all_accounts():
+        if acc["name"] in exclude:
+            continue
+        if acc["cooldownUntil"] > now:
+            continue
+        if not read_keychain(acc["service"]):
+            # Entree disparue du trousseau (compte revoque, trousseau
+            # nettoye) : on ne la propose pas, elle donnerait un 401.
+            continue
+        return acc
+    return None
 
 
 def refresh_token(refresh):
@@ -423,17 +569,21 @@ def refresh_token(refresh):
         return json.loads(r.read().decode())
 
 
-def access_token():
-    """Jeton du compte actif, rafraichi si son echeance approche."""
+def access_token(service=KEYCHAIN_SERVICE):
+    """Jeton d'un compte, rafraichi si son echeance approche.
+
+    Le cache est indexe par service : deux comptes en rotation ne doivent pas
+    se voler leur jeton.
+    """
     now = time.time()
     with _token_lock:
-        cached = _token_cache["token"]
+        entry = _token_cache.get(service) or {}
         # Cache court : le compte connecte peut changer a tout moment, on
         # veut le voir vite, mais pas relire le trousseau a chaque requete.
-        if cached and now - _token_cache["at"] < 5:
-            return cached
+        if entry.get("token") and now - entry.get("at", 0) < 5:
+            return entry["token"]
 
-    blob = read_keychain()
+    blob = read_keychain(service)
     if not blob:
         return None
     oauth = blob.get("claudeAiOauth") or {}
@@ -456,11 +606,11 @@ def access_token():
                 if data.get("expires_in"):
                     oauth["expiresAt"] = int((now + data["expires_in"]) * 1000)
                 blob["claudeAiOauth"] = oauth
-                write_keychain(blob)
-                log("jeton OAuth rafraichi")
+                write_keychain(blob, service)
+                log(f"jeton OAuth rafraichi ({service})")
 
     with _token_lock:
-        _token_cache.update(at=now, token=token, expires=expires)
+        _token_cache[service] = {"at": now, "token": token, "expires": expires}
     return token
 
 
@@ -752,11 +902,19 @@ class Router(http.server.BaseHTTPRequestHandler):
         # Sonde locale : dit ou partent les requetes, sans en emettre une.
         if path == "/__router":
             mode = current_mode()
+            now = time.time()
+            accounts = [{"name": a["name"],
+                         "resting": a["cooldownUntil"] > now,
+                         "restUntil": int(a["cooldownUntil"]) or None}
+                        for a in all_accounts()]
             if mode == "native":
+                acc = active_account()
                 return self.local(200, {
                     "mode": mode,
                     "upstream": "api.anthropic.com",
-                    "hasToken": bool(access_token()),
+                    "account": acc["name"],
+                    "accounts": accounts,
+                    "hasToken": bool(access_token(acc["service"])),
                 })
             if mode in BRIDGES:
                 cfg = BRIDGES[mode]
@@ -764,6 +922,7 @@ class Router(http.server.BaseHTTPRequestHandler):
                     "mode": mode,
                     "label": cfg["label"],
                     "upstream": cfg["host"] + cfg["path"],
+                    "accounts": accounts,
                     "hasToken": True,     # ces passerelles n'exigent pas de cle
                     "models": cfg["models"],
                 })
@@ -771,6 +930,7 @@ class Router(http.server.BaseHTTPRequestHandler):
                 "mode": mode,
                 "label": "OpenRouter",
                 "upstream": "openrouter.ai/api/v1",
+                "accounts": accounts,
                 "hasToken": bool(or_key()),
                 "models": OR_MODELS,
             })
@@ -785,7 +945,8 @@ class Router(http.server.BaseHTTPRequestHandler):
         if mode in BRIDGES:
             return self.bridged(mode, path, body)
 
-        got = self.direct(mode, body)
+        account = active_account() if mode == "native" else None
+        got = self.direct(mode, body, account)
         if got is None:
             return                       # l'erreur a deja ete rendue au client
         conn, resp = got
@@ -796,16 +957,49 @@ class Router(http.server.BaseHTTPRequestHandler):
         # l'utilisateur arrive quand meme. Une fois le SSE commence, il est
         # trop tard — on ne rejoue plus, on laisse passer l'erreur.
         if mode == "native" and resp.status == 429:
+            due = retry_after(resp)
             try:
                 resp.read()
             except Exception:
                 pass
             conn.close()
-            due = retry_after(resp)
+            rest_account(account["name"], due)
+            log(f"429 sur le compte « {account['name']} » — repos "
+                f"{max(1, round((due - time.time()) / 60))} min")
+
+            # Un autre compte Claude d'abord : un vrai Opus vaut mieux qu'un
+            # modele gratuit, et la requete n'a encore rien envoye au client.
+            tried = {account["name"]}
+            while True:
+                nxt = next_account(tried)
+                if nxt is None:
+                    break
+                set_active_account(nxt["name"])
+                log(f"bascule sur le compte « {nxt['name']} »")
+                got = self.direct("native", body, nxt)
+                if got is None:
+                    return
+                conn, resp = got
+                if resp.status != 429:
+                    return self.stream("native", path, conn, resp)
+                nxt_due = retry_after(resp)
+                try:
+                    resp.read()
+                except Exception:
+                    pass
+                conn.close()
+                rest_account(nxt["name"], nxt_due)
+                due = min(due, nxt_due)
+                tried.add(nxt["name"])
+                log(f"429 aussi sur « {nxt['name']} »")
+
+            # Tous les comptes sont au repos : c'est maintenant que le
+            # gratuit sert a quelque chose. La date de retour est celle du
+            # premier compte a se liberer.
             prov = chain()[0]
             set_mode(prov, "auto: quota Claude atteint", due)
-            log(f"429 natif -> repli {prov}, natif retente dans "
-                f"{max(1, round((due - time.time()) / 60))} min")
+            log(f"tous les comptes epuises -> repli {prov}, natif retente "
+                f"dans {max(1, round((due - time.time()) / 60))} min")
             if prov in BRIDGES:
                 return self.bridged(prov, path, body)
             got = self.direct(prov, body)
@@ -816,7 +1010,7 @@ class Router(http.server.BaseHTTPRequestHandler):
 
         return self.stream(mode, path, conn, resp)
 
-    def direct(self, mode, body):
+    def direct(self, mode, body, account=None):
         """Relaie tel quel vers un amont qui parle l'API Anthropic.
 
         Rend (connexion, reponse), ou None apres avoir rendu l'erreur au
@@ -835,12 +1029,15 @@ class Router(http.server.BaseHTTPRequestHandler):
             headers[key] = value
 
         if mode == "native":
-            token = access_token()
+            acc = account or active_account()
+            token = access_token(acc["service"])
             if not token:
                 self.local(503, {"type": "error", "error": {
                     "type": "router_error",
-                    "message": "aucun jeton OAuth actif dans le trousseau — "
-                               "lance `claude` et connecte-toi une fois."}})
+                    "message": f"aucun jeton OAuth pour le compte "
+                               f"« {acc['name']} » dans le trousseau — lance "
+                               f"`claude` et connecte-toi une fois, ou "
+                               f"`dbl accounts rm {acc['name']}`."}})
                 return None
             # Le compte actif remplace ce que Claude Code avait mis : c'est
             # tout l'interet du routeur, la session n'a rien a relire.

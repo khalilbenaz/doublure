@@ -118,12 +118,15 @@ if [ "$QUIET" = 0 ]; then
   cat <<TXT
 
   dbl                    etat courant
+  dbl accounts add <nom> enregistrer le compte Claude connecte
+  dbl accounts           tes comptes, et celui qui sert
   dbl on [zen|kilo|or]   forcer un repli
   dbl off                revenir aux comptes Claude
   dbl auto off           desarmer le repli automatique
 
 Claude Code ne relit settings.json qu'au demarrage : relance tes sessions
 ouvertes une derniere fois. Ensuite le repli est automatique — quand ton
-quota Claude tombe, la requete en cours repart par un modele gratuit.
+quota Claude tombe, la requete en cours repart sur un autre de tes comptes
+si tu en as enregistre un, sinon par un modele gratuit.
 TXT
 fi

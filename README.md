@@ -4,22 +4,26 @@
 plus jouer — et la salle ne s'en aperçoit pas.
 
 Quand la fenêtre de quota Claude est pleine, Claude Code s'arrête net : il n'a
-pas de plan B. Doublure lui en donne un. Le `429` d'Anthropic est intercepté
-*avant* qu'un seul octet ne soit parti vers ton terminal, l'amont bascule sur
-un modèle gratuit, et **la même requête repart aussitôt**. Tu ne perds pas ton
+pas de plan B. Doublure lui en donne deux. Le `429` d'Anthropic est intercepté
+*avant* qu'un seul octet ne soit parti vers ton terminal, et **la même requête
+repart aussitôt** — d'abord sur un **autre de tes comptes Claude**, et
+seulement si tous sont épuisés, sur un modèle gratuit. Tu ne perds pas ton
 message, tu ne relances rien, tu ne redémarres pas ta session.
 
 ```
-  toi ─── claude ───► routeur local ──┬──► api.anthropic.com      (ton compte)
-                       127.0.0.1:8099 │
-                                       └──► zen / kilo / openrouter (gratuit)
-                                            ▲
-                                            └─ bascule ici, en vol, sur 429
+  toi ─── claude ───► routeur local ──┬──► api.anthropic.com  compte 1 ─┐
+                       127.0.0.1:8099 │                       compte 2  │ 429
+                                      │                       compte 3 ─┘
+                                      └──► zen / kilo / openrouter (gratuit)
+                                           ▲
+                                           └─ seulement quand tous ont dit 429
 ```
 
+- **Plusieurs comptes Claude.** Rotation automatique sur `429`, le compte
+  épuisé se met au repos, un vrai Opus avant tout modèle gratuit.
 - **Zéro configuration.** Deux des trois passerelles ne demandent aucune clé.
 - **Bascule à chaud.** Une session ouverte depuis six heures suit, sans
-  redémarrer.
+  redémarrer — changer de compte ne demande ni relogin ni nouvelle session.
 - **Auto-réparante.** Un hook `SessionStart` vérifie le montage à chaque
   lancement de `claude` et le répare tout seul.
 - **Rien à toi ne sort de la machine.** Voir [Sécurité](docs/SECURITE.md).
@@ -51,6 +55,7 @@ dbl                    # état courant
 dbl on                 # forcer le repli (premier fournisseur joignable)
 dbl on kilo            # forcer un fournisseur précis
 dbl off                # revenir aux comptes Claude
+dbl accounts           # tes comptes Claude, leur état, celui qui sert
 dbl auto off           # désarmer le repli automatique
 dbl models             # modèles servis par chaque fournisseur
 dbl probe              # re-sonder les catalogues gratuits
@@ -68,6 +73,8 @@ mode    repli zen (opencode Zen)
 auto    arme
 raison  auto: quota Claude atteint
 natif   retente dans 24 min
+compte   claude         repos 24 min     max, jeton 41 min
+compte   perso          repos 11 min     pro, jeton 38 min
 routeur en ligne (http://127.0.0.1:8099)
 ```
 
@@ -75,7 +82,50 @@ Un repli pris **à la main** n'est jamais défait tout seul : seul un repli
 automatique s'annule au retour du quota. Contredire un choix explicite serait
 pire que de rester sur un modèle plus faible.
 
+## Plusieurs comptes Claude
+
+Si tu as deux abonnements — un perso, un du boulot — Doublure les enchaîne. Sur
+un `429`, le compte épuisé est mis au repos pour la durée qu'Anthropic annonce
+lui-même, la requête repart sur le suivant, et le repli gratuit n'arrive qu'en
+dernier recours.
+
+Enregistrer un compte, c'est nommer celui auquel Claude Code est connecté *à
+cet instant* :
+
+```bash
+claude                        # connecté avec le compte A
+dbl accounts add perso        # → « perso » enregistré
+
+claude                        # /login avec le compte B
+dbl accounts add boulot       # → « boulot » enregistré
+
+dbl accounts                  # les voir tous
+```
+
+```
+* claude         pret             max, jeton 166 min
+  perso          pret             max, jeton 166 min
+  boulot         repos 12 min     pro, jeton 43 min
+```
+
+L'étoile marque le compte qui sert maintenant. `claude` est toujours là : c'est
+l'entrée que Claude Code gère lui-même, elle n'est jamais modifiée.
+
+```bash
+dbl accounts use boulot   # forcer un compte, tout de suite
+dbl accounts use auto     # rendre la main à la rotation
+dbl accounts rm perso     # retirer (efface aussi sa copie du trousseau)
+```
+
+Le routeur choisit le compte **requête par requête** : `use` prend effet sur la
+requête suivante, sans `/login` ni nouvelle session. Aucun jeton n'est écrit en
+clair — chaque compte vit dans le trousseau macOS, sous son propre service
+`Doublure-<nom>`, et `accounts.json` ne contient que des noms et des dates de
+repos. Détails dans [Sécurité](docs/SECURITE.md).
+
 ## Les trois passerelles
+
+Elles n'entrent en jeu qu'une fois **tous** tes comptes Claude au repos.
 
 | Ordre | Fournisseur | Clé | Plafond | Particularité |
 |---|---|---|---|---|

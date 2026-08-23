@@ -44,5 +44,29 @@ os.replace(tmp, path)
 print("settings.json nettoye")
 PYEOF
 
+# Copies de comptes dans le trousseau : elles contiennent de vrais jetons, il
+# n'est pas question de les laisser derriere. L'entree de Claude Code lui-meme
+# (« Claude Code-credentials ») n'est pas touchee : ta session reste connectee.
+if [ -f "$DEST/accounts.json" ]; then
+  "$PY" - "$DEST" <<'PYEOF'
+import json, os, subprocess, sys
+try:
+    with open(os.path.join(sys.argv[1], "accounts.json")) as fh:
+        items = (json.load(fh) or {}).get("accounts") or []
+except (OSError, ValueError):
+    items = []
+gone = 0
+for acc in items:
+    svc = acc.get("service") or ""
+    if not svc.startswith("Doublure-"):
+        continue
+    if subprocess.run(["security", "delete-generic-password", "-s", svc],
+                      capture_output=True).returncode == 0:
+        gone += 1
+if gone:
+    print(f"{gone} compte(s) retire(s) du trousseau")
+PYEOF
+fi
+
 rm -rf "$DEST"
 echo "desinstalle — relance tes sessions Claude Code."

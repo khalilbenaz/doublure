@@ -116,6 +116,9 @@ def read_settings():
 
 def write_settings(data):
     """Ecriture atomique — settings.json est lu a chaque demarrage de session."""
+    # ~/.claude peut ne pas exister : sur une machine ou `claude` n'a jamais
+    # tourne, l'installation echouait ici avec un FileNotFoundError.
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
     tmp = SETTINGS + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -748,6 +751,182 @@ def summary():
     }
 
 
+# --------------------------------------------------------------------------
+# Comptes Claude — plusieurs abonnements, rotation avant le gratuit
+# --------------------------------------------------------------------------
+# Le routeur fait la rotation ; ici on ne fait que nommer les comptes. Ajouter
+# un compte = copier l'entree du trousseau que Claude Code vient d'ecrire, sous
+# un nom a nous. Rien n'est stocke en clair : le fichier accounts.json ne
+# contient que des noms et des dates de repos.
+
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_PREFIX = "Doublure-"
+ACCOUNTS_FILE = os.path.join(DBL_DIR, "accounts.json")
+NAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+
+
+def keychain_read(service):
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def keychain_write(service, blob):
+    return subprocess.run(
+        ["security", "add-generic-password", "-U", "-s", service,
+         "-a", os.environ.get("USER", "claude"), "-w", json.dumps(blob)],
+        capture_output=True, text=True, timeout=10).returncode == 0
+
+
+def keychain_delete(service):
+    subprocess.run(["security", "delete-generic-password", "-s", service],
+                   capture_output=True, text=True, timeout=10)
+
+
+def accounts():
+    try:
+        with open(ACCOUNTS_FILE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    out = []
+    for item in (data.get("accounts") or []) if isinstance(data, dict) else []:
+        if isinstance(item, dict) and item.get("name"):
+            out.append({"name": str(item["name"]),
+                        "service": item.get("service")
+                        or KEYCHAIN_PREFIX + str(item["name"]),
+                        "cooldownUntil": float(item.get("cooldownUntil") or 0)})
+    return out
+
+
+def save_accounts(items):
+    os.makedirs(DBL_DIR, exist_ok=True)
+    tmp = ACCOUNTS_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"accounts": items}, fh, indent=1, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, ACCOUNTS_FILE)
+
+
+def account_label(blob):
+    """Ce que l'entree du trousseau dit du compte, pour s'y reconnaitre."""
+    oauth = (blob or {}).get("claudeAiOauth") or {}
+    bits = []
+    if oauth.get("subscriptionType"):
+        bits.append(str(oauth["subscriptionType"]))
+    exp = (oauth.get("expiresAt") or 0) / 1000.0
+    if exp:
+        left = int((exp - time.time()) / 60)
+        bits.append(f"jeton {left} min" if left > 0 else "jeton expire")
+    return ", ".join(bits) or "?"
+
+
+def accounts_add(name):
+    """Enregistre le compte connecte *maintenant* sous ce nom.
+
+    Marche a marche : `claude` puis `/login` avec le second compte, puis
+    `dbl accounts add <nom>`. On copie ce que Claude Code a ecrit, on ne
+    refait pas l'OAuth.
+    """
+    if not name or not NAME_OK.match(name):
+        return 1, ("nom attendu : lettres, chiffres, . _ - "
+                   "(ex. `dbl accounts add perso`)")
+    if name == "claude":
+        return 1, "« claude » designe deja le compte de la session"
+    blob = keychain_read(KEYCHAIN_SERVICE)
+    if not blob:
+        return 1, ("aucun compte connecte dans le trousseau — lance `claude` "
+                   "et connecte-toi, puis reessaie")
+    items = accounts()
+    service = KEYCHAIN_PREFIX + name
+    for acc in items:
+        if acc["name"] == name:
+            acc["cooldownUntil"] = 0
+            break
+    else:
+        items.append({"name": name, "service": service, "cooldownUntil": 0})
+    if not keychain_write(service, blob):
+        return 1, "le trousseau a refuse l'ecriture"
+    save_accounts(items)
+    return 0, f"compte « {name} » enregistre ({account_label(blob)})"
+
+
+def accounts_rm(name):
+    items = accounts()
+    keep = [a for a in items if a["name"] != name]
+    if len(keep) == len(items):
+        return 1, f"aucun compte « {name} »"
+    keychain_delete(KEYCHAIN_PREFIX + name)
+    save_accounts(keep)
+    st = state()
+    if st.get("account") == name:
+        # Sinon l'etat pointerait un compte disparu ; sans clef « account »,
+        # le routeur reprend le premier libre.
+        set_state(account=None)
+    return 0, f"compte « {name} » retire (trousseau compris)"
+
+
+def accounts_use(name):
+    """Force le compte a utiliser. « auto » rend la main a la rotation."""
+    if name in (None, "auto"):
+        set_state(account=None)
+        return 0, "choix du compte : automatique"
+    known = ["claude"] + [a["name"] for a in accounts()]
+    if name not in known:
+        return 1, f"aucun compte « {name} » — connus : {', '.join(known)}"
+    service = KEYCHAIN_SERVICE if name == "claude" else KEYCHAIN_PREFIX + name
+    if not keychain_read(service):
+        return 1, f"le trousseau n'a plus l'entree du compte « {name} »"
+    set_state(account=name)
+    return 0, f"compte actif : {name} (immediat, sans relancer la session)"
+
+
+def accounts_list():
+    """Tous les comptes, dans l'ordre d'essai du routeur."""
+    now = time.time()
+    want = state().get("account")
+    rows = [{"name": "claude", "service": KEYCHAIN_SERVICE, "cooldownUntil": 0}]
+    for acc in accounts():
+        if acc["service"] == KEYCHAIN_SERVICE or acc["name"] == "claude":
+            rows[0]["cooldownUntil"] = acc["cooldownUntil"]
+            continue
+        rows.append(acc)
+    # Le compte servi maintenant : celui demande s'il est libre, sinon le
+    # premier qui l'est — meme regle que le routeur.
+    active = None
+    for row in rows:
+        if row["name"] == want and row["cooldownUntil"] <= now:
+            active = row["name"]
+            break
+    if active is None:
+        for row in rows:
+            if row["cooldownUntil"] <= now:
+                active = row["name"]
+                break
+    out = []
+    for row in rows:
+        blob = keychain_read(row["service"])
+        rest = row["cooldownUntil"]
+        if not blob:
+            etat = "trousseau vide"
+        elif rest > now:
+            etat = f"repos {int((rest - now) / 60) + 1} min"
+        else:
+            etat = "pret"
+        out.append(f"{'*' if row['name'] == active else ' '} "
+                   f"{row['name']:<14s} {etat:<16s} {account_label(blob)}")
+    return out
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     arg = sys.argv[2] if len(sys.argv) > 2 else None
@@ -760,6 +939,24 @@ def main():
         val = (arg or "on") == "on"
         set_state(auto=val)
         print(f"repli automatique {'arme' if val else 'desarme'}")
+    elif cmd in ("accounts", "account"):
+        sub = arg or "list"
+        who = sys.argv[3] if len(sys.argv) > 3 else None
+        if sub == "add":
+            code, note = accounts_add(who)
+        elif sub in ("rm", "remove", "del"):
+            code, note = accounts_rm(who)
+        elif sub == "use":
+            code, note = accounts_use(who)
+        elif sub in ("list", "ls"):
+            print("\n".join(accounts_list()))
+            code, note = 0, None
+        else:
+            code, note = 1, ("usage : dbl accounts [list|add <nom>|"
+                             "rm <nom>|use <nom|auto>]")
+        if note:
+            print(note)
+        sys.exit(code)
     elif cmd == "probe":
         print(ensure_models(force_probe=True)[1])
     elif cmd == "install":
@@ -788,6 +985,10 @@ def main():
             print(f"mode    repli {cur} ({PROVIDERS[cur]['label']})")
             for alias, ref in models_for(cur).items():
                 print(f"        {alias:7s} {ref}")
+        # Les comptes sont montres dans les deux cas : en repli, c'est la
+        # seule facon de voir quand un vrai compte redevient disponible.
+        for line in accounts_list():
+            print(f"compte {line}")
         print(f"auto    {'arme' if st.get('auto') else 'desarme'}")
         if st.get("reason"):
             print(f"raison  {st['reason']}")

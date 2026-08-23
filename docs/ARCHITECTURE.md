@@ -40,15 +40,18 @@ router.py  do_POST
   ├─ overrides()             réécrit le nom de modèle vers un modèle gratuit
   │
   ├─ mode « native » ────────────────────────────────────────────┐
-  │    direct("native")                                          │
-  │      x-api-key retiré, Authorization: Bearer <jeton OAuth>    │
+  │    active_account()      compte à servir, en sautant les repos│
+  │    direct("native")                                           │
+  │      x-api-key retiré, Authorization: Bearer <jeton du compte> │
   │      anthropic-beta: oauth-2025-04-20 en tête                 │
   │      ──► api.anthropic.com                                    │
   │                                                               │
   │    si 429 et rien n'est encore parti au client :              │
-  │      set_mode(premier de la chaîne, "auto: quota atteint")     │
-  │      retry_after(resp) → quand retenter le natif              │
-  │      la MÊME requête repart ci-dessous  ─────────────────────┐│
+  │      rest_account(compte, retry_after(resp))   mise au repos   │
+  │      next_account() → un autre compte ? on rejoue ici même     │
+  │      plus aucun compte libre :                                │
+  │        set_mode(premier de la chaîne, "auto: quota atteint")   │
+  │        la MÊME requête repart ci-dessous ────────────────────┐│
   │                                                             ││
   ├─ mode « or » ◄──────────────────────────────────────────────┘│
   │    direct("or")                                              │
@@ -69,11 +72,19 @@ stream()  re-découpe le corps amont pour que le SSE reste du SSE
 
 ```python
 if mode == "native" and resp.status == 429:
+    due = retry_after(resp)            # quand ce compte revient
     resp.read(); conn.close()          # on vide et on ferme proprement
-    due  = retry_after(resp)           # quand le quota revient
-    prov = chain()[0]
-    set_mode(prov, "auto: quota Claude atteint", due)
-    ...                                # la même requête repart
+    rest_account(account["name"], due) # ce compte-là se repose
+
+    tried = {account["name"]}          # d'abord un AUTRE compte Claude
+    while (nxt := next_account(tried)):
+        conn, resp = self.direct("native", body, nxt)
+        if resp.status != 429:
+            return self.stream("native", path, conn, resp)
+        due = min(due, retry_after(resp))
+        rest_account(nxt["name"], ...); tried.add(nxt["name"])
+
+    set_mode(chain()[0], "auto: quota Claude atteint", due)   # alors le gratuit
 ```
 
 Deux choses en font une reprise et pas un simple message d'erreur :
@@ -86,10 +97,53 @@ Deux choses en font une reprise et pas un simple message d'erreur :
    lieu au milieu d'une requête où un client attend ; lancer un sous-processus
    Python le ferait patienter le temps d'un démarrage d'interpréteur.
 
+L'ordre compte : un vrai Opus sur un second abonnement vaut mieux qu'un modèle
+gratuit, donc **les comptes passent tous avant la première passerelle**. La date
+de retour au natif est celle du **premier compte à se libérer** (`min` des
+repos) : rester en repli plus longtemps que nécessaire coûte en qualité.
+
 `retry_after()` lit, dans l'ordre : `retry-after`, puis
 `anthropic-ratelimit-unified-reset`, `-requests-reset`, `-tokens-reset`. Une
 valeur `> 1e9` est une époque, sinon c'est un délai. Sans rien d'exploitable,
 30 minutes.
+
+### Plusieurs comptes Claude
+
+Le compte n'est pas choisi au démarrage mais **à chaque requête**, par
+`active_account()` — d'où le fait qu'un changement de compte ne demande ni
+`/login` ni nouvelle session.
+
+```
+all_accounts()   « claude »            = l'entrée du trousseau de Claude Code,
+                                          lue, jamais modifiée
+                 « <nom> »             = copies posées par `dbl accounts add`,
+                                          service trousseau « Doublure-<nom> »
+
+active_account() le compte demandé dans l'état s'il est libre,
+                 sinon le premier libre dans l'ordre ci-dessus
+
+rest_account()   met un compte au repos jusqu'à la date annoncée par Anthropic
+next_account()   le suivant qui n'est ni au repos, ni déjà essayé,
+                 ni absent du trousseau
+```
+
+Trois décisions valent d'être dites :
+
+- **`accounts.json` ne contient aucun secret** — un nom, un service de
+  trousseau, une date de repos. Le jeton reste dans le trousseau, chaque compte
+  dans son propre service. Le fichier peut être lu, sauvegardé, versionné sans
+  rien exposer.
+- **Le compte de la session est traité comme les autres pour le repos.** Son
+  `cooldownUntil` est mémorisé dans le même fichier même s'il n'y avait pas
+  d'entrée au départ (`all_accounts()` fusionne les deux) — sans ça, il serait
+  réessayé en boucle sur son propre `429`.
+- **Un compte dont l'entrée de trousseau a disparu est sauté**, pas proposé :
+  il donnerait un `401` présenté comme une panne du routeur.
+
+`dbl accounts add <nom>` ne refait pas l'OAuth : il **copie** l'entrée que
+Claude Code vient d'écrire, sous un nom à nous. C'est ce qui permet de gérer
+plusieurs comptes sans réimplémenter la connexion — et le rafraîchissement de
+jeton, lui, se fait compte par compte, chacun réécrit dans son propre service.
 
 ### Le chien de garde
 

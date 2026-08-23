@@ -43,7 +43,8 @@ Trois causes possibles, dans l'ordre de fréquence :
 
 1. **Le `429` est arrivé après le début du flux.** Rien à faire : rejouer
    aurait dupliqué une réponse commencée. C'est la limite du dispositif.
-2. **`auto` est désarmé.** `dbl auto on`.
+2. **`auto` est désarmé.** `dbl auto on`. (La rotation de comptes, elle, a
+   quand même eu lieu : `dbl accounts` le montre.)
 3. **Aucune passerelle ne répondait.** `dbl probe` le dit, et `lastError` dans
    `dbl` porte le détail.
 
@@ -61,6 +62,40 @@ tout seul. `dbl off` pour revenir.
 Si elle commence par `auto`, le chien de garde attend `retryNativeAt`. La ligne
 `natif retente dans N min` de `dbl` donne l'échéance. Elle vient de l'en-tête
 d'Anthropic, ou vaut 30 minutes par défaut.
+
+### Un compte ajouté n'est jamais utilisé
+
+```bash
+dbl accounts
+```
+
+Trois états parlent d'eux-mêmes :
+
+- **`trousseau vide`** : l'entrée a disparu (compte révoqué, trousseau nettoyé).
+  Le routeur saute ce compte, sinon il donnerait un `401` ressemblant à une
+  panne. Refais `claude` + `/login` avec ce compte, puis
+  `dbl accounts add <même nom>` — l'entrée est écrasée.
+- **`repos N min`** : ce compte a rendu un `429`, il attend la date annoncée par
+  Anthropic. Normal.
+- **`pret` mais sans étoile** : un autre compte est forcé. `dbl accounts use
+  auto` rend la main à la rotation.
+
+### `dbl accounts add` dit « aucun compte connecté dans le trousseau »
+
+`add` copie l'entrée que Claude Code vient d'écrire ; sans session connectée il
+n'y a rien à copier. Lance `claude`, connecte-toi, quitte, puis réessaie.
+
+Si tu es bien connecté, vérifie que l'entrée existe :
+
+```bash
+security find-generic-password -s "Claude Code-credentials" -w | head -c 40
+```
+
+### Les deux comptes ont dit `429` presque en même temps
+
+Attendu si les deux abonnements étaient déjà entamés : la rotation ne fabrique
+pas de quota, elle utilise ceux qui restent. `dbl` montre les deux repos et
+l'échéance retenue pour revenir au natif — la plus proche des deux.
 
 ### « OPENROUTER_API_KEY absente »
 
