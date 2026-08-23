@@ -59,7 +59,7 @@ date de fin de repos.
 |---|---|
 | `name` | Ce que tu tapes dans `dbl accounts use <nom>`. Lettres, chiffres, `.`, `_`, `-`, 32 caractères max. |
 | `service` | Service du trousseau macOS où vit le jeton. `Doublure-<nom>` pour les comptes ajoutés ; `Claude Code-credentials` pour celui de la session. |
-| `cooldownUntil` | Époque jusqu'à laquelle le compte est sauté, posée sur un `429` d'après ce qu'Anthropic annonce. `0` = disponible. |
+| `cooldownUntil` | Époque jusqu'à laquelle le compte est sauté. Posée soit par la sonde de quota (date de remise à zéro annoncée), soit par un `429` (en-tête `retry-after`). `0` = disponible. |
 
 Le compte nommé `claude` existe toujours, même absent du fichier : c'est
 l'entrée que Claude Code gère lui-même. Le routeur la **lit** et n'y écrit que
@@ -133,6 +133,30 @@ Le catalogue est relu chez la passerelle (`/models`), filtré sur le suffixe
 force la relecture. Si la passerelle ne répond pas, le dernier bon cache sert ;
 à défaut, une liste validée à la main — le dispositif ne doit jamais se
 retrouver avec zéro modèle proposable juste parce qu'un `/models` a expiré.
+
+## La sonde de quota
+
+Le routeur interroge `https://api.anthropic.com/api/oauth/usage` une fois par
+minute et par compte, en tâche de fond, pour mettre au repos ceux qu'Anthropic
+déclare épuisés **avant** qu'ils ne rendent un `429`. Trois constantes, en tête
+de `router.py` :
+
+| Constante | Défaut | Rôle |
+|---|---|---|
+| `USAGE_POLL` | `60.0` s | Intervalle entre deux tours de sonde. Un tour interroge tous les comptes. |
+| `USAGE_THRESHOLD` | `95.0` % | Au-delà, le compte est mis au repos. Pas 100 : la requête suivante peut être celle qui dépasse. |
+| `USAGE_BETA` | `oauth-2025-04-20` | En-tête `anthropic-beta` exigé par l'endpoint. |
+
+Le taux vu se lit dans `dbl status` (colonne `quota`) et dans la sonde locale :
+
+```bash
+curl -s http://127.0.0.1:8099/__router | python3 -m json.tool
+```
+
+Pour désarmer la prévoyance et ne garder que le `429` comme déclencheur, mettre
+`USAGE_THRESHOLD` à `101.0` dans `~/.doublure/router.py` puis
+`launchctl kickstart -k gui/$(id -u)/com.doublure.router`. Un seuil plus bas
+(80 par exemple) bascule plus tôt, au prix de quota Claude laissé sur la table.
 
 ## Désarmer le repli automatique
 

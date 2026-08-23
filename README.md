@@ -4,7 +4,10 @@
 plus jouer — et la salle ne s'en aperçoit pas.
 
 Quand la fenêtre de quota Claude est pleine, Claude Code s'arrête net : il n'a
-pas de plan B. Doublure lui en donne deux. Le `429` d'Anthropic est intercepté
+pas de plan B. Doublure lui en donne deux.
+
+Elle **surveille le quota qu'Anthropic annonce** et met un compte au repos
+avant qu'il ne soit refusé. Si un `429` passe quand même, il est intercepté
 *avant* qu'un seul octet ne soit parti vers ton terminal, et **la même requête
 repart aussitôt** — d'abord sur un **autre de tes comptes Claude**, et
 seulement si tous sont épuisés, sur un modèle gratuit. Tu ne perds pas ton
@@ -12,15 +15,20 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
 
 ```
   toi ─── claude ───► routeur local ──┬──► api.anthropic.com  compte 1 ─┐
-                       127.0.0.1:8099 │                       compte 2  │ 429
+                       127.0.0.1:8099 │                       compte 2  │ épuisés
                                       │                       compte 3 ─┘
+                                      │      ▲
+                                      │      └ /api/oauth/usage, sondé en fond
                                       └──► zen / kilo / openrouter (gratuit)
                                            ▲
-                                           └─ seulement quand tous ont dit 429
+                                           └─ seulement quand tous sont épuisés
 ```
 
-- **Plusieurs comptes Claude.** Rotation automatique sur `429`, le compte
-  épuisé se met au repos, un vrai Opus avant tout modèle gratuit.
+- **Le quota est vu venir.** Un `429` est un refus subi ; l'endpoint
+  `/api/oauth/usage` donne le même fait à l'avance, avec la date de remise à
+  zéro. Doublure le sonde une fois par minute, hors du chemin de tes requêtes.
+- **Plusieurs comptes Claude.** Rotation automatique, le compte épuisé se met
+  au repos, un vrai Opus avant tout modèle gratuit.
 - **Zéro configuration.** Deux des trois passerelles ne demandent aucune clé.
 - **Bascule à chaud.** Une session ouverte depuis six heures suit, sans
   redémarrer — changer de compte ne demande ni relogin ni nouvelle session.
@@ -84,10 +92,17 @@ pire que de rester sur un modèle plus faible.
 
 ## Plusieurs comptes Claude
 
-Si tu as deux abonnements — un perso, un du boulot — Doublure les enchaîne. Sur
-un `429`, le compte épuisé est mis au repos pour la durée qu'Anthropic annonce
-lui-même, la requête repart sur le suivant, et le repli gratuit n'arrive qu'en
-dernier recours.
+Si tu as deux abonnements — un perso, un du boulot — Doublure les enchaîne. Dès
+qu'un compte est annoncé épuisé (ou, à défaut, dès qu'il rend un `429`), il est
+mis au repos pour la durée qu'Anthropic donne lui-même, la requête part sur le
+suivant, et le repli gratuit n'arrive qu'en dernier recours.
+
+```
+$ dbl status
+mode    native — comptes Claude
+compte * perso          pret             quota 18 % (five_hour) — max, jeton 52 min
+compte   boulot         repos 96 min     quota 97 % (five_hour) — max, jeton 41 min
+```
 
 Enregistrer un compte, c'est nommer celui auquel Claude Code est connecté *à
 cet instant* :
@@ -161,9 +176,14 @@ echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.doublure/.env
 - **Les modèles gratuits sont nettement moins bons** qu'Opus ou Sonnet. C'est
   un filet, pas un remplacement. On y finit une tâche, on n'y commence pas une
   refonte.
-- **Le repli n'est pris que si le `429` arrive avant le premier octet** de la
+- **Le repli n'est pris que si le refus arrive avant le premier octet** de la
   réponse. Un quota atteint au milieu d'un flux remonte l'erreur telle quelle :
   rejouer aurait dupliqué une réponse déjà commencée.
+- **La surveillance du quota dépend d'un endpoint non documenté**
+  (`/api/oauth/usage`, celui que Claude Code utilise pour son propre affichage
+  de quota). S'il change de forme, la sonde échoue en silence et Doublure
+  retombe sur le `429` — jamais l'inverse : une sonde en panne ne met aucun
+  compte au repos.
 - **Les passerelles gratuites ne servent que `/v1/messages`** (et le comptage
   de jetons, estimé localement). Le reste de l'API Anthropic répond `404` en
   mode repli.

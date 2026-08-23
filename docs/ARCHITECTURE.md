@@ -19,7 +19,8 @@ C'est la seule raison d'être du routeur. Tout le reste en découle.
 
 ```
 src/router.py     Proxy HTTP sur 127.0.0.1:8099. Décide de l'amont, réécrit
-                  les en-têtes, intercepte le 429, relaie en flux.
+                  les en-têtes, surveille le quota annoncé, intercepte le
+                  429, relaie en flux.
 src/bridge.py     Traduction Anthropic <-> OpenAI. Fonctions pures, aucun
                   état, aucun réseau — donc testable au doigt.
 src/fallback.py   État, catalogue de modèles, sondes, bascules, CLI `dbl`.
@@ -41,6 +42,7 @@ router.py  do_POST
   │
   ├─ mode « native » ────────────────────────────────────────────┐
   │    active_account()      compte à servir, en sautant les repos│
+  │      tous au repos ? → repli direct, sans aller chercher le 429│
   │    direct("native")                                           │
   │      x-api-key retiré, Authorization: Bearer <jeton du compte> │
   │      anthropic-beta: oauth-2025-04-20 en tête                 │
@@ -68,7 +70,42 @@ router.py  do_POST
 stream()  re-découpe le corps amont pour que le SSE reste du SSE
 ```
 
-### Le point délicat : la reprise sur `429`
+### La sonde de quota : savoir avant de se faire refuser
+
+Un `429` est un refus **subi** : on l'apprend en se le prenant. Anthropic
+publie le même fait à l'avance, sur l'endpoint que Claude Code utilise pour son
+propre affichage de quota :
+
+```
+GET https://api.anthropic.com/api/oauth/usage
+Authorization: Bearer <jeton OAuth du compte>
+anthropic-beta: oauth-2025-04-20
+```
+
+Il rend, par fenêtre (`five_hour`, `seven_day`, et un tableau `limits`), un
+pourcentage d'utilisation et une date de remise à zéro. `usage_verdict()` garde
+**la fenêtre la plus avancée** — la limite hebdomadaire tombe aussi, et pour
+plus longtemps — et déclare le compte épuisé au-delà de `USAGE_THRESHOLD`
+(95 %, pas 100 : la requête suivante peut être celle qui dépasse).
+
+Trois décisions valent d'être dites :
+
+- **La sonde tourne en tâche de fond** (`usage_watch()`, un tour par minute),
+  jamais sur le chemin d'une requête. Un `GET` synchrone avant chaque message
+  ajouterait sa latence à chacun, pour une information qui bouge lentement.
+- **Elle passe par `rest_account()`**, comme un `429`. Tout le reste du routeur
+  — choix du compte, rotation, retour au natif par le `watchdog` — continue de
+  fonctionner sans savoir d'où vient l'information.
+- **Un échec de sonde ne met personne au repos.** `fetch_usage()` rend `None`
+  sur réseau coupé, jeton refusé ou endpoint modifié, et la boucle passe au
+  compte suivant. L'endpoint n'est pas documenté : le jour où il change, on
+  perd la prévoyance, pas le service — le `429` reprend son rôle de filet.
+
+Quand *tous* les comptes sont au repos, `relay()` part en repli **sans émettre
+la requête native** : le refus est déjà connu, aller le chercher ne ferait que
+perdre un aller-retour.
+
+### Le filet : la reprise sur `429`
 
 ```python
 if mode == "native" and resp.status == 429:

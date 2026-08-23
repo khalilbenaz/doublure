@@ -42,6 +42,14 @@ seulement sur les requêtes servies par son propre compte. **Les passerelles
 gratuites ne les voient jamais** : en mode repli, l'en-tête d'autorisation est
 reconstruit pour la passerelle et aucun jeton Anthropic n'est dans la requête.
 
+Une exception à connaître : la **sonde de quota** envoie chaque jeton à
+`https://api.anthropic.com/api/oauth/usage`, une fois par minute, pour lire le
+taux d'utilisation du compte. Même hôte, même jeton, même en-tête que tes
+requêtes normales — rien de nouveau ne quitte la machine, et rien de ce que la
+sonde lit n'est écrit ailleurs que dans la mémoire du routeur (les pourcentages
+ne sont pas persistés ; seule la date de repos atterrit dans
+`accounts.json`).
+
 ### L'identifiant client OAuth
 
 Nécessaire pour rafraîchir un jeton. Il est **le même pour toute installation de

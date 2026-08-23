@@ -143,6 +143,25 @@ def proxy_env():
     }
 
 
+def router_usage(timeout=2):
+    """Quota par compte, tel que le routeur l'a vu. {} si hors ligne.
+
+    C'est lui qui interroge /api/oauth/usage en tache de fond : la CLI lit son
+    releve plutot que d'en emettre un de plus.
+    """
+    try:
+        with urllib.request.urlopen(f"{ROUTER_BASE}/__router",
+                                    timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        return {}
+    out = {}
+    for row in data.get("accounts") or ():
+        if isinstance(row, dict) and row.get("usage") is not None:
+            out[row.get("name")] = (row["usage"], row.get("usageWindow"))
+    return out
+
+
 def router_alive(timeout=2):
     try:
         with urllib.request.urlopen(f"{ROUTER_BASE}/__router", timeout=timeout) as r:
@@ -912,6 +931,7 @@ def accounts_list():
             if row["cooldownUntil"] <= now:
                 active = row["name"]
                 break
+    seen = router_usage()
     out = []
     for row in rows:
         blob = keychain_read(row["service"])
@@ -922,8 +942,13 @@ def accounts_list():
             etat = f"repos {int((rest - now) / 60) + 1} min"
         else:
             etat = "pret"
+        bits = []
+        if row["name"] in seen:
+            pct, win = seen[row["name"]]
+            bits.append(f"quota {pct:.0f} %" + (f" ({win})" if win else ""))
+        bits.append(account_label(blob))
         out.append(f"{'*' if row['name'] == active else ' '} "
-                   f"{row['name']:<14s} {etat:<16s} {account_label(blob)}")
+                   f"{row['name']:<14s} {etat:<16s} {' — '.join(bits)}")
     return out
 
 

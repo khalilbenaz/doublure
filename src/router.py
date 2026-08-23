@@ -32,6 +32,7 @@ Ecoute sur 127.0.0.1 uniquement. Les corps sont relayes en flux (SSE compris),
 jamais bufferises : le streaming de Claude Code reste du streaming.
 """
 
+import datetime
 import glob
 import http.client
 import http.server
@@ -142,6 +143,17 @@ KEYCHAIN_PREFIX = "Doublure-"
 # revenir. Plus court que RETRY_NATIVE_DEFAULT : reessayer un compte ne coute
 # qu'une requete, alors que rester en repli gratuit coute en qualite.
 ACCOUNT_COOLDOWN_DEFAULT = 15 * 60
+# Anthropic annonce l'epuisement avant de le refuser : cet endpoint rend le
+# taux d'utilisation par fenetre et la date de remise a zero. Un 429 est un
+# refus subi ; ceci est le meme fait, connu a l'avance.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_BETA = "oauth-2025-04-20"
+# Sonde de fond, jamais sur le chemin d'une requete : une seule interrogation
+# par compte et par minute, et le relais ne lit qu'un cache.
+USAGE_POLL = 60.0
+# Seuil de mise au repos. Pas 100 % : la derniere requete avant la limite peut
+# etre celle qui la depasse, et on prefere basculer un cheveu trop tot.
+USAGE_THRESHOLD = 95.0
 # L'identifiant client OAuth de Claude Code n'est PAS ecrit en dur ici :
 # c'est celui de l'installation de l'utilisateur, retrouve sur sa machine
 # par client_id(). Le distribuer serait partager le notre.
@@ -615,6 +627,125 @@ def access_token(service=KEYCHAIN_SERVICE):
 
 
 # --------------------------------------------------------------------------
+# Quota annonce — /api/oauth/usage, sonde en tache de fond
+# --------------------------------------------------------------------------
+
+_usage_cache = {}          # service -> {"at": ..., "data": ...}
+_usage_lock = threading.Lock()
+
+
+def fetch_usage(service):
+    """Taux d'utilisation du compte, tel qu'Anthropic le declare.
+
+    Rend None si la question ne peut pas etre posee (pas de jeton, reseau,
+    endpoint change). Ne jamais transformer un echec de sonde en repos : on
+    laisserait un compte valide sur le banc pour une panne reseau.
+    """
+    token = access_token(service)
+    if not token:
+        return None
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": USAGE_BETA,
+        "User-Agent": BRIDGE_UA,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    with _usage_lock:
+        _usage_cache[service] = {"at": time.time(), "data": data}
+    return data
+
+
+def usage_snapshot(service):
+    """Dernier releve connu, sans rien emettre. Perime au bout de 5 minutes."""
+    with _usage_lock:
+        entry = _usage_cache.get(service)
+    if not entry or time.time() - entry["at"] > 5 * USAGE_POLL:
+        return None
+    return entry["data"]
+
+
+def _reset_at(value):
+    """Date de remise a zero : ISO 8601 ou epoque, en secondes."""
+    if isinstance(value, (int, float)):
+        return float(value) if value > 1e9 else None
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(
+            value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def usage_verdict(data):
+    """(epuise, jusqu'a, fenetre, pourcentage) d'apres un releve.
+
+    On regarde toutes les fenetres declarees, pas seulement les cinq heures :
+    la limite hebdomadaire tombe aussi, et plus longtemps.
+    """
+    worst = (0.0, None, None)
+    windows = []
+    for key in ("five_hour", "seven_day", "seven_day_opus",
+                "seven_day_sonnet"):
+        win = data.get(key)
+        if isinstance(win, dict) and win.get("utilization") is not None:
+            windows.append((key, win.get("utilization"),
+                            _reset_at(win.get("resets_at"))))
+    for lim in data.get("limits") or []:
+        if isinstance(lim, dict) and lim.get("percent") is not None:
+            windows.append((lim.get("kind") or "limite", lim["percent"],
+                            _reset_at(lim.get("resets_at"))))
+    for name, pct, until in windows:
+        try:
+            pct = float(pct)
+        except (TypeError, ValueError):
+            continue
+        if pct > worst[0]:
+            worst = (pct, until, name)
+    pct, until, name = worst
+    return pct >= USAGE_THRESHOLD, until, name, pct
+
+
+def usage_watch():
+    """Met au repos les comptes qu'Anthropic declare epuises, avant le 429.
+
+    Le repos passe par rest_account() : tout le reste du routeur — choix du
+    compte, rotation, retour au natif — continue de fonctionner sans savoir
+    d'ou vient l'information.
+    """
+    while True:
+        try:
+            now = time.time()
+            for acc in all_accounts():
+                data = fetch_usage(acc["service"])
+                if data is None:
+                    continue
+                spent, until, name, pct = usage_verdict(data)
+                if not spent:
+                    continue
+                until = until or (now + ACCOUNT_COOLDOWN_DEFAULT)
+                if until <= now:
+                    continue
+                # Deja au repos pour au moins aussi longtemps : ne pas
+                # reecrire le fichier a chaque tour de sonde.
+                if acc["cooldownUntil"] >= until - USAGE_POLL:
+                    continue
+                rest_account(acc["name"], until)
+                log(f"quota annonce a {pct:.0f} % ({name}) sur le compte "
+                    f"« {acc['name']} » — repos preventif "
+                    f"{max(1, round((until - now) / 60))} min")
+        except Exception as e:                      # un thread de fond ne meurt pas
+            log(f"sonde de quota: {type(e).__name__}")
+        time.sleep(USAGE_POLL)
+
+
+# --------------------------------------------------------------------------
 # OpenRouter : cle, nom de modele, corps de requete
 # --------------------------------------------------------------------------
 
@@ -903,10 +1034,17 @@ class Router(http.server.BaseHTTPRequestHandler):
         if path == "/__router":
             mode = current_mode()
             now = time.time()
-            accounts = [{"name": a["name"],
-                         "resting": a["cooldownUntil"] > now,
-                         "restUntil": int(a["cooldownUntil"]) or None}
-                        for a in all_accounts()]
+            accounts = []
+            for a in all_accounts():
+                row = {"name": a["name"],
+                       "resting": a["cooldownUntil"] > now,
+                       "restUntil": int(a["cooldownUntil"]) or None}
+                seen = usage_snapshot(a["service"])
+                if seen:
+                    _, _, win, pct = usage_verdict(seen)
+                    row["usage"] = round(pct, 1)
+                    row["usageWindow"] = win
+                accounts.append(row)
             if mode == "native":
                 acc = active_account()
                 return self.local(200, {
@@ -942,6 +1080,22 @@ class Router(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else None
 
         mode = current_mode()
+
+        # Le quota est deja annonce epuise sur *tous* les comptes : le 429 est
+        # connu d'avance, aller le chercher ne ferait que perdre un
+        # aller-retour. active_account() ne rend un compte au repos que
+        # lorsqu'aucun autre n'est libre — c'est exactement ce cas.
+        if mode == "native":
+            acc = active_account()
+            if acc["cooldownUntil"] > time.time():
+                due = min(a["cooldownUntil"] for a in all_accounts())
+                prov = chain()[0]
+                set_mode(prov, "auto: quota annonce atteint", due)
+                log(f"quota annonce epuise sur tous les comptes -> repli "
+                    f"{prov} sans attendre le 429, natif retente dans "
+                    f"{max(1, round((due - time.time()) / 60))} min")
+                mode = prov
+
         if mode in BRIDGES:
             return self.bridged(mode, path, body)
 
@@ -1130,6 +1284,7 @@ def main():
     except OSError as e:
         sys.exit(f"port {PORT} indisponible : {e}")
     threading.Thread(target=watchdog, daemon=True).start()
+    threading.Thread(target=usage_watch, daemon=True).start()
     log(f"routeur pret sur http://{HOST}:{PORT} (mode {current_mode()})")
     try:
         srv.serve_forever()
