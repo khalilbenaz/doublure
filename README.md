@@ -19,8 +19,9 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
                                       │                       compte 3 ─┘
                                       │      ▲
                                       │      └ /api/oauth/usage, sondé en fond
-                                      └──► zen / kilo / openrouter (gratuit)
-                                           ▲
+                                      └──► zen ─► kilo ─► openrouter (gratuit)
+                                           ▲       saturée ? la suivante
+                                           │
                                            └─ seulement quand tous sont épuisés
 ```
 
@@ -29,6 +30,9 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
   zéro. Doublure le sonde une fois par minute, hors du chemin de tes requêtes.
 - **Plusieurs comptes Claude.** Rotation automatique, le compte épuisé se met
   au repos, un vrai Opus avant tout modèle gratuit.
+- **La chaîne va jusqu'au bout.** Une passerelle gratuite saturée ne fait pas
+  échouer la requête : la suivante est essayée, et celle qui vient de refuser
+  est écartée quelques minutes. Le message part, quoi qu'il arrive.
 - **Zéro configuration.** Deux des trois passerelles ne demandent aucune clé.
 - **Bascule à chaud, dans les deux sens.** Une session ouverte depuis six
   heures suit, sans redémarrer — changer de compte ne demande ni relogin ni
@@ -149,6 +153,13 @@ Elles n'entrent en jeu qu'une fois **tous** tes comptes Claude au repos.
 | 1 | **opencode Zen** | non | aucun constaté | API OpenAI, traduite |
 | 2 | **Kilo** | non | aucun constaté | API OpenAI, catalogue plus large |
 | 3 | **OpenRouter** | oui | 50 req/jour (gratuit) | seul à parler l'API Anthropic |
+
+L'ordre est un ordre d'essai, pas un choix unique : si la première ne répond
+pas — saturée, en panne, réseau coupé — la requête part sur la deuxième, puis
+sur la troisième. Celle qui vient de refuser est mise au repos **5 minutes**
+(1 minute si c'était le réseau) pour ne pas repayer son échec à chaque message,
+et celle qui a répondu devient le nouveau premier maillon. L'erreur n'arrive au
+client qu'après les avoir toutes tentées.
 
 Les deux sans plafond passent d'abord. OpenRouter est le seul à comprendre
 `/v1/messages` nativement — donc le plus fidèle — mais son palier gratuit

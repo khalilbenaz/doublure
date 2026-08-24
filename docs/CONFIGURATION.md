@@ -16,6 +16,9 @@ défaut.
 ```
 ~/.doublure/state.json     mode courant, ordre des fournisseurs, surcharges
 ~/.doublure/accounts.json  comptes Claude : nom, service trousseau, repos
+~/.doublure/state.lock     verrou des deux fichiers ci-dessus, partagé par le
+                           routeur et le CLI (vide, jamais lu — seul son
+                           `flock` compte ; le supprimer est sans effet)
 ~/.doublure/.env           OPENROUTER_API_KEY=sk-or-...
 ~/.doublure/client-id      identifiant client OAuth mis en cache
 ~/.doublure/free-models.json   catalogue des modèles gratuits (cache 6 h)
@@ -157,6 +160,21 @@ Pour désarmer la prévoyance et ne garder que le `429` comme déclencheur, mett
 `USAGE_THRESHOLD` à `101.0` dans `~/.doublure/router.py` puis
 `launchctl kickstart -k gui/$(id -u)/com.doublure.router`. Un seuil plus bas
 (80 par exemple) bascule plus tôt, au prix de quota Claude laissé sur la table.
+
+## Le repos des passerelles gratuites
+
+Une passerelle qui vient de refuser est écartée quelques minutes, pour ne pas
+repayer son échec à chaque message. Deux constantes, en tête de `router.py` :
+
+| Constante | Défaut | Rôle |
+|---|---|---|
+| `PROVIDER_REST` | `300` s | Repos après un `429` ou un `5xx`. Court : ces passerelles sont partagées, une saturation passe vite. |
+| `PROVIDER_REST_NET` | `60` s | Repos après une panne réseau ou un amont injoignable. Encore plus court : c'est souvent une coupure de quelques secondes. |
+
+Ce repos vit **en mémoire**, pas dans `state.json` : redémarrer le routeur le
+remet à zéro, et c'est voulu. Si toutes les passerelles sont au repos en même
+temps, les repos sont purgés et la chaîne est retentée — rendre une erreur alors
+qu'une passerelle est peut-être revenue serait le mauvais choix.
 
 ## Désarmer le repli automatique
 

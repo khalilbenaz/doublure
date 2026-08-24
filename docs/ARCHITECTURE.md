@@ -15,7 +15,7 @@ message suivant.
 
 C'est la seule raison d'être du routeur. Tout le reste en découle.
 
-## Les trois pièces
+## Les quatre pièces
 
 ```
 src/router.py     Proxy HTTP sur 127.0.0.1:8099. Décide de l'amont, réécrit
@@ -24,9 +24,12 @@ src/router.py     Proxy HTTP sur 127.0.0.1:8099. Décide de l'amont, réécrit
 src/bridge.py     Traduction Anthropic <-> OpenAI. Fonctions pures, aucun
                   état, aucun réseau — donc testable au doigt.
 src/fallback.py   État, catalogue de modèles, sondes, bascules, CLI `dbl`.
+src/statefile.py  Écriture atomique et verrou inter-processus des fichiers
+                  d'état. Partagé par les deux précédents, qui écrivent les
+                  mêmes fichiers depuis deux processus différents.
 ```
 
-`install.sh` copie les trois dans `~/.doublure`, écrit le LaunchAgent, et sert
+`install.sh` copie les quatre dans `~/.doublure`, écrit le LaunchAgent, et sert
 lui-même de hook `SessionStart`. `uninstall.sh` défait exactement ça.
 
 ## Le chemin d'une requête
@@ -69,6 +72,12 @@ router.py  do_POST
   ▼
 stream()  re-découpe le corps amont pour que le SSE reste du SSE
 ```
+
+Le re-découpage est en `chunked`, pour que le flux ressorte au fil de l'eau sans
+attendre la fin de la génération — **sauf pour une réponse sans corps**. Un
+`HEAD`, un `204` ou un `304` n'a rien à annoncer : y coller un
+`Transfer-Encoding: chunked` laisse le client attendre un corps qui n'arrivera
+jamais.
 
 ### La sonde de quota : savoir avant de se faire refuser
 
@@ -144,6 +153,74 @@ repos) : rester en repli plus longtemps que nécessaire coûte en qualité.
 valeur `> 1e9` est une époque, sinon c'est un délai. Sans rien d'exploitable,
 30 minutes.
 
+### La chaîne de repli, jusqu'au bout
+
+`chain()` rend une liste — `["zen", "kilo", "or"]` — et `serve_fallback()`
+l'essaie **maillon par maillon**. C'est nécessaire, pas décoratif : une
+passerelle gratuite est partagée par tout le monde, sa saturation est le cas
+courant. N'essayer que le premier maillon revenait à rendre son `429` au client
+alors que les deux autres auraient répondu — l'exact contraire de la promesse.
+
+```
+serve_fallback(path, body, order)
+  order          la passerelle en place d'abord, puis le reste de la chaîne
+  ├─ écarte celles au repos (toutes au repos ? on purge et on retente :
+  │  mieux vaut réessayer que rendre une erreur)
+  ├─ pour chacune : bridged() ou or_served() en mode « quiet »
+  │    répond → on persiste ce choix comme nouveau mode, et on sert
+  │    refuse  → rest_provider(), on passe à la suivante
+  └─ toutes épuisées → on rend l'échec du repli *préféré*, le plus parlant.
+                       Les autres sont dans le journal.
+```
+
+Le repos d'une passerelle est **en mémoire seulement**, jamais dans
+`state.json` : une indisponibilité de cinq minutes n'a pas à survivre au
+routeur. Il dure `PROVIDER_REST` (5 min) sur un `429` ou un `5xx`, et
+`PROVIDER_REST_NET` (60 s) sur une panne réseau — une coupure dure souvent
+quelques secondes, la punir cinq minutes serait absurde.
+
+Le mode `quiet` de `direct()` existe pour ça : hors cascade, un échec est écrit
+au client et l'affaire est close ; en cascade, l'appelant veut la main pour
+essayer la suivante.
+
+### Une seule requête bascule à la fois
+
+Claude Code émet plusieurs requêtes en parallèle — la conversation, la
+compaction, les titres, les sous-agents. Elles tapent le même mur de quota au
+même instant. Sans précaution, chacune déroule la rotation complète : tous les
+comptes brûlés en double, autant de bascules concurrentes qui s'écrasent, et un
+journal illisible.
+
+D'où `_switch_lock`, tenu par la seule requête qui mène la bascule :
+
+```python
+held = _switch_lock.acquire()
+try:
+    if current_mode() != "native":
+        # une autre requête a déjà tranché pendant notre 429 :
+        # on suit sa décision au lieu de la refaire
+        ...
+    while (nxt := next_account(tried)):
+        ...
+        if resp.status != 429:
+            _switch_lock.release()   # AVANT de streamer
+            held = False
+            return self.stream("native", path, conn, resp)
+finally:
+    if held:
+        _switch_lock.release()
+```
+
+Deux détails portent tout le poids :
+
+- **Le mode est relu après l'acquisition.** Celle qui attendait n'a plus rien à
+  décider si la première a déjà basculé ; elle suit, ce qui est aussi la bonne
+  réponse pour le client.
+- **Le verrou tombe avant `stream()`.** Une génération dure des minutes. Le
+  garder pendant le flux transformerait un verrou de décision en sérialisation
+  de tout le trafic — le remède serait pire que le mal. Même raison pour le
+  `serve_fallback` final, exécuté hors verrou.
+
 ### Plusieurs comptes Claude
 
 Le compte n'est pas choisi au démarrage mais **à chaque requête**, par
@@ -210,6 +287,12 @@ chaque tour — une ligne de journal par minute pour rien.
 Il attrape `Exception` largement et journalise : un thread de fond qui meurt
 laisserait le repli armé pour toujours, en silence.
 
+**La même vérification a lieu à l'entrée de chaque requête.** Le chien de garde
+ne passe qu'une fois par minute : une requête qui arrive entre deux tours
+partait en modèle gratuit alors que le quota était déjà revenu — jusqu'à 60
+secondes de qualité perdue pour rien. Le contrôle en entrée ne coûte rien : le
+relevé de quota est déjà en cache, il n'émet aucun appel réseau.
+
 ## La traduction d'API
 
 `bridge.py` ne fait que transformer des dictionnaires. Trois subtilités, chacune
@@ -241,11 +324,49 @@ exception. Les tables vivent dans les deux fichiers : `router.py` fait la
 réécriture réelle, `fallback.py` sert l'affichage et les sondes — elles doivent
 rester alignées.
 
-## L'état
+## L'état, et les deux façons de le corrompre
 
-Un seul fichier, `~/.doublure/state.json`, relu à chaud avec un cache d'une
-seconde. Écriture atomique (`.tmp` + `os.replace`) : un `state.json` tronqué
-laisserait le routeur sans mode.
+`~/.doublure/state.json` porte le mode, relu à chaud avec un cache d'une
+seconde ; `accounts.json` porte les comptes et leurs repos. Tous deux sont
+écrits en `.tmp` + `os.replace` : un fichier tronqué laisserait le routeur sans
+mode.
+
+Ça ne suffit pas, et les deux défauts qui restaient étaient silencieux.
+
+**Deux threads du routeur.** `set_mode()`, `set_active_account()` et
+`write_accounts()` visaient tous le même nom de fichier temporaire. Deux
+écritures simultanées et le second `open(tmp, "w")` tronque ce que le premier
+était en train d'écrire — `os.replace` publie alors un JSON coupé en deux. Le
+nom du `.tmp` porte donc maintenant le **pid et l'identifiant de thread**.
+
+**Deux processus.** Le routeur et le CLI `dbl` écrivent les mêmes fichiers sans
+se voir. Chacun lisait, modifiait, réécrivait : un `dbl accounts use perso`
+tombant au mauvais moment **effaçait la bascule automatique** que le routeur
+venait de décider. Une écriture atomique ne protège pas de ça — elle garantit
+que le fichier est entier, pas qu'il tient compte de ce que l'autre vient
+d'écrire.
+
+D'où `statefile.py` : un verrou `fcntl.flock` sur `~/.doublure/state.lock`, pris
+par les deux programmes autour de chaque cycle lire-modifier-écrire.
+
+```python
+with statefile.file_lock():
+    cur = state()
+    cur.update(kw)
+    statefile.write_json(STATE_FILE, cur)
+```
+
+Un détail non négociable : le verrou est **réentrant**, par compteur de
+profondeur. `flock` s'applique au descripteur de fichier, pas au thread — un
+second `flock(LOCK_EX)` depuis le même processus réussit sans attendre et le
+premier `LOCK_UN` relâche tout. Sans le compteur, `accounts_add()` qui appelle
+`save_accounts()` sous le même verrou libérerait la protection au milieu de son
+propre travail, en silence.
+
+Et un verrou qu'on ne peut pas prendre ne doit pas empêcher de router :
+`file_lock` avale l'`OSError` (volume en lecture seule, descripteurs épuisés) et
+laisse passer, `write_json` rend `False` et le routeur continue en mémoire.
+Router sans mémoriser vaut mieux que ne pas router.
 
 Les emplacements des versions précédentes sont **lus, jamais écrits** — une
 installation existante ne doit perdre ni sa clé ni son mode courant.

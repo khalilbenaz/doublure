@@ -21,8 +21,45 @@ launchctl kickstart -k "gui/$(id -u)/com.doublure.router"
 tail -30 ~/.doublure/router.log
 ```
 
-Si le journal montre un `EADDRINUSE`, le port est pris par autre chose :
-réinstalle avec `DOUBLURE_PORT=8123 ./install.sh`.
+Si le journal montre un `EADDRINUSE`, le port est pris par autre chose — voir
+juste en dessous, c'est le piège le plus coûteux du lot.
+
+### Le routeur répond, mais rien de ce qui a changé ne s'applique
+
+Le symptôme est trompeur : `dbl` dit « routeur en ligne », les requêtes passent,
+et pourtant une nouveauté (un compte ajouté, une constante modifiée, une mise à
+jour) reste sans effet. C'est qu'**un autre programme occupe le port** — une
+installation précédente, un routeur maison, une seconde installation de
+Doublure. Le vrai routeur, lui, meurt à chaque démarrage sur
+`[Errno 48] Address already in use` et launchd le relance en boucle, sans que
+rien ne remonte à la surface.
+
+Qui écoute vraiment :
+
+```bash
+lsof -nP -iTCP:8099 -sTCP:LISTEN          # le PID qui tient le port
+ps -ww -o args= -p <PID>                  # et le script qu'il exécute
+grep "indisponible" ~/.doublure/router.log | tail -3
+```
+
+La sonde locale tranche aussi : si `/__router` ne rend **pas** de champ
+`accounts`, ce n'est pas ce routeur-ci qui répond.
+
+```bash
+curl -s http://127.0.0.1:8099/__router | python3 -m json.tool
+```
+
+S'il s'agit d'un LaunchAgent tiers, sors-le et garde son plist de côté :
+
+```bash
+grep -rl 8099 ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/<le.job.trouvé>
+mv ~/Library/LaunchAgents/<le.job.trouvé>.plist{,.disabled}   # réversible
+launchctl kickstart -k gui/$(id -u)/com.doublure.router
+```
+
+Si les deux doivent cohabiter, donne un autre port à Doublure :
+`DOUBLURE_PORT=8123 ./install.sh` (et le même `DOUBLURE_PORT` pour `dbl`).
 
 ### Claude Code dit « connection refused »
 
@@ -45,8 +82,13 @@ Trois causes possibles, dans l'ordre de fréquence :
    aurait dupliqué une réponse commencée. C'est la limite du dispositif.
 2. **`auto` est désarmé.** `dbl auto on`. (La rotation de comptes, elle, a
    quand même eu lieu : `dbl accounts` le montre.)
-3. **Aucune passerelle ne répondait.** `dbl probe` le dit, et `lastError` dans
-   `dbl` porte le détail.
+3. **Aucune passerelle ne répondait.** Les trois sont tentées avant qu'une
+   erreur remonte, donc c'est bien qu'aucune n'a pu servir. `dbl probe` le dit,
+   `lastError` dans `dbl` porte le détail, et le journal nomme chaque échec :
+
+   ```bash
+   grep "repli .* indisponible" ~/.doublure/router.log | tail -5
+   ```
 
 ### Le repli reste armé alors que le quota est revenu
 
