@@ -32,6 +32,10 @@ import time
 import urllib.error
 import urllib.request
 
+# Pose a cote de ce fichier par l'installeur, comme router.py et bridge.py.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import statefile  # noqa: E402  (le chemin doit etre pose avant l'import)
+
 HOME = os.path.expanduser("~")
 SETTINGS = os.path.join(HOME, ".claude", "settings.json")
 # Tout ce que l'outil ecrit tient dans un seul dossier : le desinstaller, c'est
@@ -92,14 +96,17 @@ def state():
 
 
 def set_state(**kw):
-    cur = state()
-    cur.update(kw)
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(cur, fh, indent=1)
-    os.replace(tmp, STATE_FILE)
-    return cur
+    """Modifie l'etat champ par champ, sous le verrou partage avec le routeur.
+
+    Le routeur ecrit le meme fichier depuis un autre processus. Lire et
+    reecrire sans verrou effacait sa derniere decision — une bascule
+    automatique annulee par un simple changement de compte.
+    """
+    with statefile.file_lock():
+        cur = state()
+        cur.update(kw)
+        statefile.write_json(STATE_FILE, cur)
+        return cur
 
 
 # --------------------------------------------------------------------------
@@ -418,11 +425,7 @@ def catalog(pid, refresh=False):
     if live:
         cache[pid] = {"at": int(time.time()), "models": [list(e) for e in live]}
         try:
-            os.makedirs(os.path.dirname(FREE_CACHE), exist_ok=True)
-            tmp = FREE_CACHE + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(cache, fh, indent=1)
-            os.replace(tmp, FREE_CACHE)
+            statefile.write_json(FREE_CACHE, cache)
         except OSError:
             pass
         return live
@@ -828,12 +831,8 @@ def accounts():
 
 
 def save_accounts(items):
-    os.makedirs(DBL_DIR, exist_ok=True)
-    tmp = ACCOUNTS_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump({"accounts": items}, fh, indent=1, ensure_ascii=False)
-        fh.write("\n")
-    os.replace(tmp, ACCOUNTS_FILE)
+    with statefile.file_lock():
+        statefile.write_json(ACCOUNTS_FILE, {"accounts": items})
 
 
 def account_label(blob):
@@ -865,27 +864,32 @@ def accounts_add(name):
     if not blob:
         return 1, ("aucun compte connecte dans le trousseau — lance `claude` "
                    "et connecte-toi, puis reessaie")
-    items = accounts()
     service = KEYCHAIN_PREFIX + name
-    for acc in items:
-        if acc["name"] == name:
-            acc["cooldownUntil"] = 0
-            break
-    else:
-        items.append({"name": name, "service": service, "cooldownUntil": 0})
-    if not keychain_write(service, blob):
-        return 1, "le trousseau a refuse l'ecriture"
-    save_accounts(items)
+    # Relire et reecrire sous le meme verrou : deux `dbl accounts` concurrents
+    # perdaient l'un des deux comptes.
+    with statefile.file_lock():
+        items = accounts()
+        for acc in items:
+            if acc["name"] == name:
+                acc["cooldownUntil"] = 0
+                break
+        else:
+            items.append({"name": name, "service": service,
+                          "cooldownUntil": 0})
+        if not keychain_write(service, blob):
+            return 1, "le trousseau a refuse l'ecriture"
+        save_accounts(items)
     return 0, f"compte « {name} » enregistre ({account_label(blob)})"
 
 
 def accounts_rm(name):
-    items = accounts()
-    keep = [a for a in items if a["name"] != name]
-    if len(keep) == len(items):
-        return 1, f"aucun compte « {name} »"
-    keychain_delete(KEYCHAIN_PREFIX + name)
-    save_accounts(keep)
+    with statefile.file_lock():
+        items = accounts()
+        keep = [a for a in items if a["name"] != name]
+        if len(keep) == len(items):
+            return 1, f"aucun compte « {name} »"
+        keychain_delete(KEYCHAIN_PREFIX + name)
+        save_accounts(keep)
     st = state()
     if st.get("account") == name:
         # Sinon l'etat pointerait un compte disparu ; sans clef « account »,

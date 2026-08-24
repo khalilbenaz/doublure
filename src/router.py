@@ -56,6 +56,7 @@ HOME = os.path.expanduser("~")
 # Le pont vit a cote de ce fichier, ou qu'on l'ait installe.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge  # noqa: E402  (le chemin doit etre pose avant l'import)
+import statefile  # noqa: E402
 
 DBL_DIR = os.path.join(HOME, ".doublure")
 STATE = os.path.join(DBL_DIR, "state.json")
@@ -143,6 +144,12 @@ KEYCHAIN_PREFIX = "Doublure-"
 # revenir. Plus court que RETRY_NATIVE_DEFAULT : reessayer un compte ne coute
 # qu'une requete, alors que rester en repli gratuit coute en qualite.
 ACCOUNT_COOLDOWN_DEFAULT = 15 * 60
+# Repos d'une passerelle gratuite qui vient de refuser (429) ou de tomber
+# (5xx). Court : ces passerelles sont partagees, une saturation passe vite.
+PROVIDER_REST = 5 * 60
+# Panne reseau ou amont injoignable : encore plus court, c'est souvent une
+# coupure d'une poignee de secondes.
+PROVIDER_REST_NET = 60
 # Anthropic annonce l'epuisement avant de le refuser : cet endpoint rend le
 # taux d'utilisation par fenetre et la date de remise a zero. Un 429 est un
 # refus subi ; ceci est le meme fait, connu a l'avance.
@@ -179,10 +186,42 @@ _token_lock = threading.Lock()
 _cid_cache = {"id": ""}
 _cid_lock = threading.Lock()
 
+# Une seule requete a la fois mene une bascule. Claude Code emet plusieurs
+# requetes en parallele : sans ce verrou, chacune brule tous les comptes sur
+# le meme 429 et ecrase la decision des autres.
+_switch_lock = threading.Lock()
+# Passerelles gratuites au repos apres un echec. En memoire seulement : une
+# indisponibilite de cinq minutes n'a pas a survivre au routeur.
+_provider_rest = {}
+_provider_lock = threading.Lock()
+
 
 def log(msg):
     sys.stderr.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
     sys.stderr.flush()
+
+
+def _write_json(path, data):
+    ok = statefile.write_json(path, data)
+    if not ok:
+        log(f"{os.path.basename(path)} non ecrit — bascule en memoire seule")
+    return ok
+
+
+def rest_provider(name, secs):
+    """Met une passerelle gratuite au repos : la chaine la sautera."""
+    with _provider_lock:
+        _provider_rest[name] = time.time() + float(secs)
+
+
+def provider_resting(name):
+    with _provider_lock:
+        return _provider_rest.get(name, 0) > time.time()
+
+
+def clear_provider_rest():
+    with _provider_lock:
+        _provider_rest.clear()
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +261,21 @@ def read_state():
     return {}
 
 
+def update_state(**kw):
+    """Modifie l'etat champ par champ, sans perdre ce qu'un autre thread ecrit.
+
+    La lecture et l'ecriture tiennent dans un seul verrou : sinon deux threads
+    lisent le meme etat, en modifient chacun un champ, et le second efface la
+    modification du premier — un changement de compte annulant une bascule de
+    mode, par exemple.
+    """
+    with statefile.file_lock():
+        data = read_state()
+        data.update(kw)
+        _write_json(STATE, data)
+        return data
+
+
 def set_mode(mode, reason, retry_at=0):
     """Ecrit le mode dans l'etat, atomiquement, et purge le cache de lecture.
 
@@ -229,18 +283,8 @@ def set_mode(mode, reason, retry_at=0):
     lieu au milieu d'une requete client qui attend, et lancer un sous-processus
     la ferait patienter le temps d'un demarrage de Python.
     """
-    data = read_state()
-    data.update(mode=mode, since=int(time.time()), reason=reason,
-                retryNativeAt=int(retry_at))
-    os.makedirs(DBL_DIR, exist_ok=True)
-    tmp = STATE + ".tmp"
-    try:
-        with open(tmp, "w") as fh:
-            json.dump(data, fh, indent=1, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, STATE)
-    except OSError as e:
-        log(f"etat non ecrit ({type(e).__name__}) — bascule en memoire seule")
+    update_state(mode=mode, since=int(time.time()), reason=reason,
+                 retryNativeAt=int(retry_at))
     with _state_lock:
         _state_cache.update(at=time.time(), mode=mode)
 
@@ -471,15 +515,8 @@ def read_accounts():
 
 
 def write_accounts(accounts):
-    os.makedirs(DBL_DIR, exist_ok=True)
-    tmp = ACCOUNTS_FILE + ".tmp"
-    try:
-        with open(tmp, "w") as fh:
-            json.dump({"accounts": accounts}, fh, indent=1, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, ACCOUNTS_FILE)
-    except OSError as e:
-        log(f"comptes non ecrits ({type(e).__name__})")
+    with statefile.file_lock():
+        _write_json(ACCOUNTS_FILE, {"accounts": accounts})
 
 
 def all_accounts():
@@ -525,17 +562,7 @@ def active_account():
 
 def set_active_account(name):
     """Note dans l'etat le compte a utiliser. Relu a chaud comme le mode."""
-    data = read_state()
-    data["account"] = name
-    os.makedirs(DBL_DIR, exist_ok=True)
-    tmp = STATE + ".tmp"
-    try:
-        with open(tmp, "w") as fh:
-            json.dump(data, fh, indent=1, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, STATE)
-    except OSError as e:
-        log(f"etat non ecrit ({type(e).__name__})")
+    update_state(account=name)
 
 
 def rest_account(name, until):
@@ -544,17 +571,21 @@ def rest_account(name, until):
     Le compte de la session n'echappe pas a la regle : son repos est garde
     dans le meme fichier, meme s'il n'a pas d'entree propre au depart.
     """
-    accounts = read_accounts()
-    for acc in accounts:
-        if acc["name"] == name:
-            acc["cooldownUntil"] = float(until)
-            break
-    else:
-        accounts.insert(0, {"name": name,
-                            "service": KEYCHAIN_SERVICE if name == "claude"
-                            else KEYCHAIN_PREFIX + name,
-                            "cooldownUntil": float(until)})
-    write_accounts(accounts)
+    # Relecture et ecriture sous le meme verrou : la sonde de quota et une
+    # requete qui prend un 429 mettent au repos en meme temps, et le repos
+    # perdu ferait reessayer un compte en boucle sur son propre refus.
+    with statefile.file_lock():
+        accounts = read_accounts()
+        for acc in accounts:
+            if acc["name"] == name:
+                acc["cooldownUntil"] = float(until)
+                break
+        else:
+            accounts.insert(0, {"name": name,
+                                "service": KEYCHAIN_SERVICE if name == "claude"
+                                else KEYCHAIN_PREFIX + name,
+                                "cooldownUntil": float(until)})
+        write_accounts(accounts)
 
 
 def next_account(exclude, now=None):
@@ -974,8 +1005,14 @@ class Router(http.server.BaseHTTPRequestHandler):
         self.relay()
 
     # -- passerelles OpenAI (Zen, Kilo) -----------------------------------
-    def bridged(self, mode, path, body):
-        """Sert /v1/messages depuis une passerelle qui ne parle qu'OpenAI."""
+    def bridged(self, mode, path, body, cascade=False):
+        """Sert /v1/messages depuis une passerelle qui ne parle qu'OpenAI.
+
+        Rend (servi, echec). `servi` est vrai des qu'une reponse est partie au
+        client. En mode `cascade`, un echec ne rend rien au client : c'est
+        l'appelant qui essaiera la passerelle suivante, et le message de
+        l'utilisateur n'est pas perdu pour autant.
+        """
         cfg = BRIDGES[mode]
 
         try:
@@ -990,14 +1027,21 @@ class Router(http.server.BaseHTTPRequestHandler):
         if path.endswith("/count_tokens"):
             n = bridge.count_tokens(data)
             log(f"{mode} count_tokens -> {n}")
-            return self.local(200, {"input_tokens": n})
+            self.local(200, {"input_tokens": n})
+            return True, None
 
         if not path.endswith("/messages"):
             # Le reste de l'API Anthropic (modeles, lots...) n'a pas
-            # d'equivalent : mieux vaut le dire que relayer dans le vide.
-            return self.local(404, {"type": "error", "error": {
+            # d'equivalent ici. En chaine, une autre passerelle peut savoir le
+            # servir : on ne repond 404 que si aucune n'a pu.
+            err = {"status": 404, "rest": 0,
+                   "detail": f"{path} n'est pas servi par {cfg['label']}"}
+            if cascade:
+                return False, err
+            self.local(404, {"type": "error", "error": {
                 "type": "not_found_error",
                 "message": f"{path} n'est pas servi par le repli {cfg['label']}."}})
+            return True, None
 
         model = bridge_model(mode, data.get("model"))
         stream = bool(data.get("stream"))
@@ -1018,9 +1062,13 @@ class Router(http.server.BaseHTTPRequestHandler):
             resp = conn.getresponse()
         except Exception as e:
             log(f"{mode} {path} -> injoignable ({type(e).__name__})")
-            return self.local(502, {"type": "error", "error": {
-                "type": "router_error",
-                "message": f"{cfg['label']} injoignable ({type(e).__name__})"}})
+            err = {"status": 502, "rest": PROVIDER_REST_NET,
+                   "detail": f"{cfg['label']} injoignable ({type(e).__name__})"}
+            if cascade:
+                return False, err
+            self.local(502, {"type": "error", "error": {
+                "type": "router_error", "message": err["detail"]}})
+            return True, None
 
         if resp.status >= 400:
             detail = resp.read(2000).decode("utf-8", "replace")
@@ -1029,10 +1077,19 @@ class Router(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
             log(f"{mode} {path} -> {resp.status} ({model})")
+            # Un 429 ou un 5xx dit que *la passerelle* est indisponible : on la
+            # met au repos. Un autre 4xx met en cause la requete elle-meme, et
+            # la passerelle suivante rendrait la meme reponse : rien a punir.
+            rest = (PROVIDER_REST if resp.status == 429 or resp.status >= 500
+                    else 0)
+            err = {"status": resp.status, "rest": rest,
+                   "detail": f"{cfg['label']} / {model} : {detail[:400]}"}
+            if cascade:
+                return False, err
             kind = "rate_limit_error" if resp.status == 429 else "api_error"
-            return self.local(resp.status, {"type": "error", "error": {
-                "type": kind,
-                "message": f"{cfg['label']} / {model} : {detail[:400]}"}})
+            self.local(resp.status, {"type": "error", "error": {
+                "type": kind, "message": err["detail"]}})
+            return True, None
 
         log(f"{mode} {self.command} {path} -> {resp.status} ({model}"
             f"{', flux' if stream else ''})")
@@ -1047,7 +1104,9 @@ class Router(http.server.BaseHTTPRequestHandler):
                     conn.close()
                 except Exception:
                     pass
-            return self.local(200, bridge.to_anthropic(upstream, data.get("model") or model))
+            self.local(200, bridge.to_anthropic(upstream,
+                                                data.get("model") or model))
+            return True, None
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -1067,6 +1126,74 @@ class Router(http.server.BaseHTTPRequestHandler):
                 conn.close()
             except Exception:
                 pass
+        return True, None
+
+    # -- chaine de repli ---------------------------------------------------
+    def or_served(self, path, body):
+        """OpenRouter : il parle l'API Anthropic, donc relais direct.
+
+        Meme contrat que bridged() : (servi, echec), et rien n'est rendu au
+        client sur un echec — l'appelant essaie la passerelle suivante.
+        """
+        conn, resp, err = self.direct("or", body, quiet=True)
+        if err:
+            return False, err
+        if resp.status >= 400:
+            try:
+                detail = resp.read(2000).decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            try:
+                conn.close()
+            except Exception:
+                pass
+            log(f"or {path} -> {resp.status}")
+            rest = (PROVIDER_REST if resp.status == 429 or resp.status >= 500
+                    else 0)
+            return False, {"status": resp.status, "rest": rest,
+                           "detail": f"OpenRouter : {detail[:400]}"}
+        self.stream("or", path, conn, resp)
+        return True, None
+
+    def serve_fallback(self, path, body, order, persist=False, due=0):
+        """Sert la requete par la premiere passerelle de `order` qui repond.
+
+        La chaine existait deja mais seul son premier maillon etait essaye :
+        une passerelle gratuite saturee — le cas le plus courant — rendait son
+        429 au client alors que les deux autres auraient repondu. Or c'est
+        exactement la promesse de l'outil : le message ne se perd pas.
+        """
+        live = [p for p in order if not provider_resting(p)]
+        if not live:
+            # Toutes au repos : mieux vaut retenter que rendre une erreur.
+            clear_provider_rest()
+            live = list(order)
+        first = None
+        for prov in live:
+            if prov in BRIDGES:
+                served, err = self.bridged(prov, path, body, cascade=True)
+            else:
+                served, err = self.or_served(path, body)
+            if served:
+                # La passerelle qui a repondu devient celle qu'on essaiera en
+                # premier : inutile de repayer l'echec a chaque requete.
+                if persist and prov != current_mode():
+                    set_mode(prov, "auto: quota Claude atteint",
+                             due or (time.time() + RETRY_NATIVE_DEFAULT))
+                return
+            if err.get("rest"):
+                rest_provider(prov, err["rest"])
+            first = first or err
+            if live[-1] != prov:
+                log(f"repli {prov} indisponible ({err['status']}) — suivant")
+
+        # Aucune n'a pu servir : on rend l'echec du repli prefere, c'est le
+        # plus parlant. Les autres sont dans le journal.
+        err = first or {"status": 502, "detail": "aucun repli configure"}
+        code = err["status"]
+        self.local(code, {"type": "error", "error": {
+            "type": "rate_limit_error" if code == 429 else "api_error",
+            "message": f"aucun repli disponible — {err['detail']}"}})
 
     def relay(self):
         path = urllib.parse.urlparse(self.path).path
@@ -1122,45 +1249,81 @@ class Router(http.server.BaseHTTPRequestHandler):
 
         mode = current_mode()
 
+        # Fin de la fenetre de quota. Le chien de garde ne passe qu'une fois
+        # par minute : une requete qui arrive entre-temps n'a aucune raison de
+        # partir en repli alors que le natif est redevenu disponible. Le releve
+        # de quota est deja en cache, cette verification n'emet rien.
+        if mode != "native":
+            st = read_state()
+            due = st.get("retryNativeAt") or 0
+            if (str(st.get("reason", "")).startswith("auto") and due
+                    and time.time() >= due and not quota_still_full()):
+                set_mode("native", "auto: fenetre de quota ecoulee")
+                log("retour au natif (verifie a la requete)")
+                mode = "native"
+
         # Le quota est deja annonce epuise sur *tous* les comptes : le 429 est
         # connu d'avance, aller le chercher ne ferait que perdre un
         # aller-retour. active_account() ne rend un compte au repos que
         # lorsqu'aucun autre n'est libre — c'est exactement ce cas.
-        if mode == "native":
-            acc = active_account()
-            if acc["cooldownUntil"] > time.time():
-                due = min(a["cooldownUntil"] for a in all_accounts())
-                prov = chain()[0]
-                set_mode(prov, "auto: quota annonce atteint", due)
-                log(f"quota annonce epuise sur tous les comptes -> repli "
-                    f"{prov} sans attendre le 429, natif retente dans "
-                    f"{max(1, round((due - time.time()) / 60))} min")
-                mode = prov
+        if mode == "native" and active_account()["cooldownUntil"] > time.time():
+            with _switch_lock:
+                mode = current_mode()          # relu : un autre a pu basculer
+                if mode == "native":
+                    due = min(a["cooldownUntil"] for a in all_accounts())
+                    prov = chain()[0]
+                    set_mode(prov, "auto: quota annonce atteint", due)
+                    log(f"quota annonce epuise sur tous les comptes -> repli "
+                        f"{prov} sans attendre le 429, natif retente dans "
+                        f"{max(1, round((due - time.time()) / 60))} min")
+                    mode = prov
 
-        if mode in BRIDGES:
-            return self.bridged(mode, path, body)
+        if mode != "native":
+            # Deja en repli : on part de la passerelle en place, mais la chaine
+            # entiere reste disponible si elle ne repond pas.
+            st = read_state()
+            order = [mode] + [p for p in chain() if p != mode]
+            return self.serve_fallback(
+                path, body, order,
+                persist=str(st.get("reason", "")).startswith("auto"),
+                due=st.get("retryNativeAt") or 0)
 
-        account = active_account() if mode == "native" else None
-        got = self.direct(mode, body, account)
-        if got is None:
+        account = active_account()
+        conn, resp, err = self.direct("native", body, account)
+        if err:
             return                       # l'erreur a deja ete rendue au client
-        conn, resp = got
 
         # Quota Claude atteint. C'est le seul endroit ou le repli peut se
         # prendre sans rien perdre : aucun octet n'est encore parti vers le
         # client, donc la meme requete repart ailleurs et le message de
         # l'utilisateur arrive quand meme. Une fois le SSE commence, il est
         # trop tard — on ne rejoue plus, on laisse passer l'erreur.
-        if mode == "native" and resp.status == 429:
-            due = retry_after(resp)
-            try:
-                resp.read()
-            except Exception:
-                pass
-            conn.close()
-            rest_account(account["name"], due)
-            log(f"429 sur le compte « {account['name']} » — repos "
-                f"{max(1, round((due - time.time()) / 60))} min")
+        if resp.status != 429:
+            return self.stream("native", path, conn, resp)
+
+        due = retry_after(resp)
+        try:
+            resp.read()
+        except Exception:
+            pass
+        conn.close()
+        rest_account(account["name"], due)
+        log(f"429 sur le compte « {account['name']} » — repos "
+            f"{max(1, round((due - time.time()) / 60))} min")
+
+        # Une seule requete mene la rotation. Claude Code en emet plusieurs en
+        # parallele : sans ce verrou, chacune brule tous les comptes sur le
+        # meme quota et le journal devient illisible.
+        held = _switch_lock.acquire()
+        try:
+            if current_mode() != "native":
+                # Une autre requete a deja fait la rotation pendant notre 429 :
+                # on suit sa decision au lieu de la refaire.
+                mode = current_mode()
+                _switch_lock.release()
+                held = False
+                order = [mode] + [p for p in chain() if p != mode]
+                return self.serve_fallback(path, body, order)
 
             # Un autre compte Claude d'abord : un vrai Opus vaut mieux qu'un
             # modele gratuit, et la requete n'a encore rien envoye au client.
@@ -1171,11 +1334,14 @@ class Router(http.server.BaseHTTPRequestHandler):
                     break
                 set_active_account(nxt["name"])
                 log(f"bascule sur le compte « {nxt['name']} »")
-                got = self.direct("native", body, nxt)
-                if got is None:
+                conn, resp, err = self.direct("native", body, nxt)
+                if err:
                     return
-                conn, resp = got
                 if resp.status != 429:
+                    # Le verrou tombe avant de streamer : une generation dure
+                    # des minutes, et rien ne doit attendre derriere.
+                    _switch_lock.release()
+                    held = False
                     return self.stream("native", path, conn, resp)
                 nxt_due = retry_after(resp)
                 try:
@@ -1191,26 +1357,24 @@ class Router(http.server.BaseHTTPRequestHandler):
             # Tous les comptes sont au repos : c'est maintenant que le
             # gratuit sert a quelque chose. La date de retour est celle du
             # premier compte a se liberer.
-            prov = chain()[0]
-            set_mode(prov, "auto: quota Claude atteint", due)
-            log(f"tous les comptes epuises -> repli {prov}, natif retente "
-                f"dans {max(1, round((due - time.time()) / 60))} min")
-            if prov in BRIDGES:
-                return self.bridged(prov, path, body)
-            got = self.direct(prov, body)
-            if got is None:
-                return
-            conn, resp = got
-            mode = prov
+            set_mode(chain()[0], "auto: quota Claude atteint", due)
+            log(f"tous les comptes epuises -> repli {chain()[0]}, natif "
+                f"retente dans {max(1, round((due - time.time()) / 60))} min")
+        finally:
+            if held:
+                _switch_lock.release()
 
-        return self.stream(mode, path, conn, resp)
+        # Hors verrou : servir peut prendre le temps d'une generation entiere.
+        return self.serve_fallback(path, body, chain(), persist=True, due=due)
 
-    def direct(self, mode, body, account=None):
+    def direct(self, mode, body, account=None, quiet=False):
         """Relaie tel quel vers un amont qui parle l'API Anthropic.
 
-        Rend (connexion, reponse), ou None apres avoir rendu l'erreur au
-        client. La reponse n'est pas consommee : l'appelant decide encore de
-        la renvoyer ou de rejouer ailleurs.
+        Rend (connexion, reponse, None), ou (None, None, echec). La reponse
+        n'est pas consommee : l'appelant decide encore de la renvoyer ou de
+        rejouer ailleurs. Sauf en mode `quiet`, un echec a deja ete rendu au
+        client — `quiet` sert la chaine de repli, qui veut essayer la
+        passerelle suivante plutot que de conclure.
         """
         path = urllib.parse.urlparse(self.path).path
         host, port, tls = UPSTREAM_OR if mode == "or" else UPSTREAM_NATIVE
@@ -1227,13 +1391,15 @@ class Router(http.server.BaseHTTPRequestHandler):
             acc = account or active_account()
             token = access_token(acc["service"])
             if not token:
-                self.local(503, {"type": "error", "error": {
-                    "type": "router_error",
-                    "message": f"aucun jeton OAuth pour le compte "
-                               f"« {acc['name']} » dans le trousseau — lance "
-                               f"`claude` et connecte-toi une fois, ou "
-                               f"`dbl accounts rm {acc['name']}`."}})
-                return None
+                err = {"status": 503, "rest": 0,
+                       "detail": f"aucun jeton OAuth pour le compte "
+                                 f"« {acc['name']} » dans le trousseau — lance "
+                                 f"`claude` et connecte-toi une fois, ou "
+                                 f"`dbl accounts rm {acc['name']}`."}
+                if not quiet:
+                    self.local(503, {"type": "error", "error": {
+                        "type": "router_error", "message": err["detail"]}})
+                return None, None, err
             # Le compte actif remplace ce que Claude Code avait mis : c'est
             # tout l'interet du routeur, la session n'a rien a relire.
             headers.pop("x-api-key", None)
@@ -1246,11 +1412,14 @@ class Router(http.server.BaseHTTPRequestHandler):
         else:
             key = or_key()
             if not key:
-                self.local(503, {"type": "error", "error": {
-                    "type": "router_error",
-                    "message": "OPENROUTER_API_KEY introuvable dans "
-                               "~/.doublure/.env — repli impossible."}})
-                return None
+                err = {"status": 503, "rest": 0,
+                       "detail": "OPENROUTER_API_KEY introuvable dans "
+                                 "~/.doublure/.env"}
+                if not quiet:
+                    self.local(503, {"type": "error", "error": {
+                        "type": "router_error",
+                        "message": err["detail"] + " — repli impossible."}})
+                return None, None, err
             headers.pop("x-api-key", None)
             headers.pop("X-Api-Key", None)
             # Propres a Anthropic : sans objet en amont, et « beta » peut
@@ -1274,15 +1443,23 @@ class Router(http.server.BaseHTTPRequestHandler):
             resp = conn.getresponse()
         except Exception as e:
             log(f"{mode} {path} -> injoignable ({type(e).__name__})")
-            self.local(502, {"type": "error", "error": {
-                "type": "router_error",
-                "message": f"amont {host}:{port} injoignable ({type(e).__name__})"}})
-            return None
-        return conn, resp
+            err = {"status": 502, "rest": PROVIDER_REST_NET,
+                   "detail": f"amont {host}:{port} injoignable "
+                             f"({type(e).__name__})"}
+            if not quiet:
+                self.local(502, {"type": "error", "error": {
+                    "type": "router_error", "message": err["detail"]}})
+            return None, None, err
+        return conn, resp, None
 
     def stream(self, mode, path, conn, resp):
         """Renvoie la reponse amont au client, au fil de l'eau."""
         log(f"{mode} {self.command} {path} -> {resp.status}")
+
+        # Une reponse sans corps ne doit pas repartir en chunked : annoncer
+        # un corps sur un HEAD, un 204 ou un 304 laisse le client attendre
+        # quelque chose qui n'arrivera jamais.
+        bodyless = self.command == "HEAD" or resp.status in (204, 304)
 
         # On reforme la reponse : le corps repart en chunked pour que le SSE
         # sorte au fil de l'eau, sans attendre la fin de la generation.
@@ -1293,8 +1470,20 @@ class Router(http.server.BaseHTTPRequestHandler):
             if key.lower() in HOP_BY_HOP:
                 continue
             self.send_header(key, value)
-        self.send_header("Transfer-Encoding", "chunked")
+        if not bodyless:
+            self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
+
+        if bodyless:
+            try:
+                resp.read()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
 
         try:
             while True:

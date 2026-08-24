@@ -30,7 +30,7 @@ mkdir -p "$DEST" "$HOME/Library/LaunchAgents" || die "$DEST non creable"
 
 # --- sources -------------------------------------------------------------
 if [ "$SRC" != "$DEST" ]; then
-  for f in router.py bridge.py fallback.py; do
+  for f in router.py bridge.py fallback.py statefile.py; do
     cmp -s "$SRC/$f" "$DEST/$f" || { cp "$SRC/$f" "$DEST/$f" && say "copie $f"; }
   done
   cmp -s "$HERE/install.sh" "$DEST/install.sh" || cp "$HERE/install.sh" "$DEST/install.sh"
