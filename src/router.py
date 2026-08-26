@@ -10,6 +10,9 @@ decide *a chaque requete* ou l'envoyer :
 
   mode natif    -> https://api.anthropic.com, avec le jeton OAuth du compte
                    actif (lu dans le trousseau macOS de Claude Code)
+  mode fcc      -> proxy Free Claude Code local (127.0.0.1:8082), qui parle
+                   l'API Anthropic et couvre une cinquantaine de
+                   fournisseurs gratuits
   mode zen/kilo -> passerelles OpenAI-compatibles, traduites par `bridge.py`
   mode or       -> https://openrouter.ai/api/v1, seul amont a parler l'API
                    Anthropic nativement (/v1/messages, SSE, tool_use)
@@ -67,6 +70,19 @@ LEGACY_STATE = (os.path.join(HOME, ".claude", "fcc-fallback.json"),
 UPSTREAM_NATIVE = ("api.anthropic.com", 443, True)
 UPSTREAM_OR = ("openrouter.ai", 443, True)
 
+# Free Claude Code, installe en local (http://127.0.0.1:8082). Il parle
+# l'API Anthropic nativement et porte a lui seul une cinquantaine de
+# fournisseurs (NVIDIA NIM, OpenRouter, Groq, Cerebras, Ollama...), avec sa
+# propre chaine de repli et son suivi de sante des modeles. Tenir a jour
+# une table de modeles gratuits n'est donc plus notre affaire : ce repli
+# passe devant nos passerelles ecrites a la main.
+FCC_PORT = int(os.environ.get("FCC_PORT", "8082"))
+UPSTREAM_FCC = ("127.0.0.1", FCC_PORT, False)
+FCC_ENV = os.path.join(HOME, ".fcc", ".env")
+# FCC n'exige pas de cle par defaut : ce jeton est un marqueur, pas un
+# secret — il satisfait juste le controle « une cle est presente ».
+FCC_TOKEN = "doublure"
+
 # OpenRouter sert l'API Anthropic sous /api/v1 ; Claude Code appelle /v1.
 OR_PREFIX = "/api"
 ENV_FILE = os.path.join(DBL_DIR, ".env")
@@ -123,10 +139,13 @@ BRIDGES = {
     },
 }
 
-MODES = ("native", "or", "zen", "kilo")
-# Ordre d'essai des replis quand le natif tombe sur un 429. Les deux premiers
-# ne demandent aucune cle : ils marchent pour n'importe qui, tout de suite.
-DEFAULT_CHAIN = ("zen", "kilo", "or")
+MODES = ("native", "fcc", "or", "zen", "kilo")
+# Ordre d'essai des replis quand le natif tombe sur un 429. FCC d'abord :
+# c'est le seul dont le catalogue est entretenu ailleurs qu'ici, et il
+# reessaie lui-meme chez un autre fournisseur avant de rendre un echec.
+# Viennent ensuite les deux passerelles sans cle, puis OpenRouter dont le
+# quota journalier s'epuise en une session.
+DEFAULT_CHAIN = ("fcc", "zen", "kilo", "or")
 # Delai de repli quand l'amont n'annonce pas lui-meme son echeance.
 RETRY_NATIVE_DEFAULT = 30 * 60
 
@@ -240,9 +259,11 @@ def current_mode():
                 data = json.load(fh)
         except (OSError, ValueError):
             continue
-        if isinstance(data, dict) and data.get("mode") in MODES + ("fcc",):
-            # « fcc » est l'ancien nom du repli : il vaut « or » desormais.
-            mode = "or" if data["mode"] == "fcc" else data["mode"]
+        if isinstance(data, dict) and data.get("mode") in MODES:
+            # « fcc » designait autrefois OpenRouter ; il designe desormais
+            # le proxy Free Claude Code local, meilleur repli que lui — un
+            # etat ancien pointe donc au bon endroit sans traduction.
+            mode = data["mode"]
             break
     with _state_lock:
         _state_cache.update(at=now, mode=mode)
@@ -289,6 +310,53 @@ def set_mode(mode, reason, retry_at=0):
         _state_cache.update(at=time.time(), mode=mode)
 
 
+_fcc_probe = {"at": 0.0, "up": False}
+
+
+def fcc_up():
+    """Le proxy Free Claude Code ecoute-t-il ? Sonde TCP, en cache 30 s.
+
+    Sans cette verification, un FCC arrete ferait payer un refus de
+    connexion a chaque requete de repli avant de passer au suivant.
+    """
+    now = time.time()
+    if now - _fcc_probe["at"] < 30:
+        return _fcc_probe["up"]
+    up = False
+    try:
+        socket.create_connection(UPSTREAM_FCC[:2], timeout=0.4).close()
+        up = True
+    except OSError:
+        pass
+    _fcc_probe.update(at=now, up=up)
+    return up
+
+
+def fcc_models():
+    """Modeles que FCC servira par alias, lus dans son propre .env.
+
+    Purement informatif (sonde /__router, statusline) : la correspondance
+    est faite par FCC, le routeur ne reecrit aucun nom pour lui.
+    """
+    out = {}
+    try:
+        with open(FCC_ENV) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("MODEL="):
+                    out.setdefault("default", line[len("MODEL="):].strip())
+                    continue
+                for alias in ("opus", "sonnet", "fable", "haiku"):
+                    pref = "MODEL_%s=" % alias.upper()
+                    if line.startswith(pref):
+                        val = line[len(pref):].strip()
+                        if val and val != "None":
+                            out[alias] = val
+    except OSError:
+        pass
+    return out
+
+
 def chain():
     """Ordre des replis a essayer. Sans cle, OpenRouter est ecarte.
 
@@ -299,6 +367,8 @@ def chain():
     order = [p for p in order if p in MODES and p != "native"]
     if not or_key():
         order = [p for p in order if p != "or"]
+    if not fcc_up():
+        order = [p for p in order if p != "fcc"]
     return order or ["zen"]
 
 
@@ -1129,13 +1199,16 @@ class Router(http.server.BaseHTTPRequestHandler):
         return True, None
 
     # -- chaine de repli ---------------------------------------------------
-    def or_served(self, path, body):
-        """OpenRouter : il parle l'API Anthropic, donc relais direct.
+    def api_served(self, prov, path, body):
+        """Repli qui parle deja l'API Anthropic : relais direct, sans pont.
 
-        Meme contrat que bridged() : (servi, echec), et rien n'est rendu au
-        client sur un echec — l'appelant essaie la passerelle suivante.
+        OpenRouter et le proxy Free Claude Code sont dans ce cas — aucune
+        traduction OpenAI a faire, contrairement aux passerelles de
+        BRIDGES. Meme contrat que bridged() : (servi, echec), et rien n'est
+        rendu au client sur un echec — l'appelant essaie le suivant.
         """
-        conn, resp, err = self.direct("or", body, quiet=True)
+        label = "Free Claude Code" if prov == "fcc" else "OpenRouter"
+        conn, resp, err = self.direct(prov, body, quiet=True)
         if err:
             return False, err
         if resp.status >= 400:
@@ -1147,12 +1220,12 @@ class Router(http.server.BaseHTTPRequestHandler):
                 conn.close()
             except Exception:
                 pass
-            log(f"or {path} -> {resp.status}")
+            log(f"{prov} {path} -> {resp.status}")
             rest = (PROVIDER_REST if resp.status == 429 or resp.status >= 500
                     else 0)
             return False, {"status": resp.status, "rest": rest,
-                           "detail": f"OpenRouter : {detail[:400]}"}
-        self.stream("or", path, conn, resp)
+                           "detail": f"{label} : {detail[:400]}"}
+        self.stream(prov, path, conn, resp)
         return True, None
 
     def serve_fallback(self, path, body, order, persist=False, due=0):
@@ -1173,7 +1246,7 @@ class Router(http.server.BaseHTTPRequestHandler):
             if prov in BRIDGES:
                 served, err = self.bridged(prov, path, body, cascade=True)
             else:
-                served, err = self.or_served(path, body)
+                served, err = self.api_served(prov, path, body)
             if served:
                 # La passerelle qui a repondu devient celle qu'on essaiera en
                 # premier : inutile de repayer l'echec a chaque requete.
@@ -1231,6 +1304,15 @@ class Router(http.server.BaseHTTPRequestHandler):
                     "accounts": accounts,
                     "hasToken": True,     # ces passerelles n'exigent pas de cle
                     "models": cfg["models"],
+                })
+            if mode == "fcc":
+                return self.local(200, {
+                    "mode": mode,
+                    "label": "Free Claude Code",
+                    "upstream": f"127.0.0.1:{FCC_PORT}/v1",
+                    "accounts": accounts,
+                    "hasToken": fcc_up(),
+                    "models": fcc_models(),
                 })
             return self.local(200, {
                 "mode": mode,
@@ -1377,7 +1459,12 @@ class Router(http.server.BaseHTTPRequestHandler):
         passerelle suivante plutot que de conclure.
         """
         path = urllib.parse.urlparse(self.path).path
-        host, port, tls = UPSTREAM_OR if mode == "or" else UPSTREAM_NATIVE
+        if mode == "or":
+            host, port, tls = UPSTREAM_OR
+        elif mode == "fcc":
+            host, port, tls = UPSTREAM_FCC
+        else:
+            host, port, tls = UPSTREAM_NATIVE
         # Chemin amont : OpenRouter prefixe l'API Anthropic par /api.
         path_up = self.path
 
@@ -1409,6 +1496,24 @@ class Router(http.server.BaseHTTPRequestHandler):
             if "oauth-2025-04-20" not in beta:
                 headers["anthropic-beta"] = \
                     ("oauth-2025-04-20," + beta) if beta else "oauth-2025-04-20"
+        elif mode == "fcc":
+            # FCC fait lui-meme la correspondance alias -> modele
+            # (MODEL_OPUS, MODEL_SONNET...) : reecrire le nom du modele ici
+            # lui retirerait ce reglage. Le corps repart donc tel quel.
+            #
+            # Le jeton OAuth du compte Claude n'a rien a faire chez lui, et
+            # « anthropic-beta: oauth-2025-04-20 » ferait refuser la
+            # requete : les deux sautent, remplaces par un marqueur.
+            for name in ("x-api-key", "X-Api-Key",
+                         "Authorization", "authorization"):
+                headers.pop(name, None)
+            headers["x-api-key"] = FCC_TOKEN
+            beta = (headers.pop("anthropic-beta", None)
+                    or headers.pop("Anthropic-Beta", None) or "")
+            kept = ",".join(p for p in beta.split(",")
+                            if p and "oauth" not in p)
+            if kept:
+                headers["anthropic-beta"] = kept
         else:
             key = or_key()
             if not key:

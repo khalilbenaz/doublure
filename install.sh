@@ -31,7 +31,8 @@ mkdir -p "$DEST" "$HOME/Library/LaunchAgents" || die "$DEST non creable"
 # --- sources -------------------------------------------------------------
 if [ "$SRC" != "$DEST" ]; then
   for f in router.py bridge.py fallback.py statefile.py; do
-    cmp -s "$SRC/$f" "$DEST/$f" || { cp "$SRC/$f" "$DEST/$f" && say "copie $f"; }
+    cmp -s "$SRC/$f" "$DEST/$f" ||
+      { cp "$SRC/$f" "$DEST/$f" && changed=1 && say "copie $f"; }
   done
   cmp -s "$HERE/install.sh" "$DEST/install.sh" || cp "$HERE/install.sh" "$DEST/install.sh"
   chmod +x "$DEST/install.sh"
@@ -95,6 +96,15 @@ if [ "$want" != "$(cat "$PLIST" 2>/dev/null)" ]; then
 fi
 launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null
 
+# Sources copiees : le daemon tourne toujours sur l'ancien code. Le hook de
+# session copiait bien les fichiers mais ne rechargeait rien — un correctif
+# n'entrait en vigueur qu'au prochain redemarrage de la machine. La coupure
+# dure moins d'une seconde et le routeur ne garde aucun etat en memoire.
+if [ -n "$changed" ]; then
+  launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null &&
+    say "routeur relance"
+fi
+
 # --- identifiant client OAuth ------------------------------------------
 # Retrouve maintenant, pendant qu'on a le PATH complet de l'utilisateur : le
 # LaunchAgent, lui, demarre avec un PATH minimal ou `claude` peut manquer.
@@ -120,7 +130,7 @@ if [ "$QUIET" = 0 ]; then
   dbl                    etat courant
   dbl accounts add <nom> enregistrer le compte Claude connecte
   dbl accounts           tes comptes, et celui qui sert
-  dbl on [zen|kilo|or]   forcer un repli
+  dbl on [fcc|zen|kilo|or]  forcer un repli
   dbl off                revenir aux comptes Claude
   dbl auto off           desarmer le repli automatique
 

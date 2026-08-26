@@ -63,7 +63,7 @@ router.py  do_POST
   │      or_body() : modèle → nvidia/...:free, chemin préfixé /api│
   │      ──► openrouter.ai  (parle l'API Anthropic nativement)    │
   │                                                               │
-  └─ mode « zen » / « kilo » ◄───────────────────────────────────┘
+  └─ mode « fcc » / « zen » / « kilo » ◄─────────────────────────┘
        bridged()
          bridge.to_openai(corps)      Anthropic → OpenAI
          ──► passerelle /chat/completions
@@ -155,7 +155,8 @@ valeur `> 1e9` est une époque, sinon c'est un délai. Sans rien d'exploitable,
 
 ### La chaîne de repli, jusqu'au bout
 
-`chain()` rend une liste — `["zen", "kilo", "or"]` — et `serve_fallback()`
+`chain()` rend une liste — `["fcc", "zen", "kilo", "or"]`, `fcc` élagué si le
+proxy local ne répond pas — et `serve_fallback()`
 l'essaie **maillon par maillon**. C'est nécessaire, pas décoratif : une
 passerelle gratuite est partagée par tout le monde, sa saturation est le cas
 courant. N'essayer que le premier maillon revenait à rendre son `429` au client

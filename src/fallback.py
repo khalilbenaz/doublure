@@ -48,8 +48,12 @@ ENV_FILE = os.path.join(DBL_DIR, ".env")
 LEGACY_ENV = (os.path.join(HOME, ".fcc", ".env"),)
 LEGACY_STATE = (os.path.join(HOME, ".claude-swap-backup", "fallback.json"),)
 OR_BASE = "https://openrouter.ai/api/v1"
-# Conserve : le dashboard s'en sert encore pour nommer l'amont du repli.
-FCC_BASE = OR_BASE
+# Free Claude Code, installe en local : proxy qui parle l'API Anthropic et
+# couvre une cinquantaine de fournisseurs. Son catalogue et sa propre chaine
+# de repli sont entretenus chez lui, pas ici.
+FCC_BASE = "http://127.0.0.1:%s" % os.environ.get("FCC_PORT", "8082")
+FCC_ENV = os.path.join(HOME, ".fcc", ".env")
+FCC_TOKEN = "doublure"
 # Le routeur : settings.json pointe dessus en permanence, et c'est lui qui
 # choisit l'amont a chaque requete. C'est ce qui rend la bascule immediate
 # pour une session Claude Code deja ouverte — settings.json n'etant relu
@@ -257,8 +261,9 @@ def mode():
     cur = state().get("mode")
     if cur in PROVIDERS:
         return cur
-    # « fcc » est l'ancien nom du repli, quand il n'y avait qu'OpenRouter.
-    return "or" if cur == "fcc" else "native"
+    # « fcc » designait autrefois OpenRouter ; c'est desormais un vrai
+    # fournisseur (le proxy local), donc rendu par le test ci-dessus.
+    return "native"
 
 
 # --------------------------------------------------------------------------
@@ -298,7 +303,39 @@ KILO_MODELS = {
     "haiku":  "nvidia/nemotron-3.5-lightning:free",
 }
 
+def fcc_models():
+    """Table alias -> modele telle que FCC la sert, lue dans son .env.
+
+    Figer ces noms ici les condamnerait a mentir : c'est le reglage de FCC
+    (MODEL_OPUS, MODEL_SONNET...) qui decide, et il change depuis son propre
+    tableau de bord.
+    """
+    out, default = {}, ""
+    try:
+        with open(FCC_ENV) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("MODEL="):
+                    default = line[len("MODEL="):].strip()
+                    continue
+                for alias in ALIASES:
+                    pref = "MODEL_%s=" % alias.upper()
+                    if line.startswith(pref):
+                        val = line[len(pref):].strip()
+                        if val and val != "None":
+                            out[alias] = val
+    except OSError:
+        pass
+    return {a: out.get(a) or default or "(non configure)" for a in ALIASES}
+
+
 PROVIDERS = {
+    "fcc": {
+        "label": "Free Claude Code",
+        "base": FCC_BASE,
+        "models": {},          # lue a chaud par fcc_models()
+        "key": False,
+    },
     "zen": {
         "label": "opencode Zen",
         "base": "https://opencode.ai/zen/v1",
@@ -319,7 +356,10 @@ PROVIDERS = {
     },
 }
 
-CHAIN = ("zen", "kilo", "or")
+# FCC en tete : son catalogue est entretenu ailleurs qu'ici et il reessaie
+# lui-meme chez un autre fournisseur avant de rendre un echec. Suivent les
+# deux passerelles sans cle, puis OpenRouter et son quota journalier.
+CHAIN = ("fcc", "zen", "kilo", "or")
 
 # Catalogue des modeles gratuits : liste vivante, relue chez la passerelle.
 #
@@ -366,6 +406,8 @@ def _pretty(mid, name):
 
 def _fetch_free(pid):
     """Modeles gratuits declares par la passerelle. [] si elle ne repond pas."""
+    if pid == "fcc":
+        return _fetch_fcc()
     cfg = PROVIDERS[pid]
     headers = {"User-Agent": UA}
     if cfg["key"]:
@@ -394,6 +436,30 @@ def _fetch_free(pid):
         hint = f"contexte {int(ctx) // 1000}k" if isinstance(ctx, (int, float)) and ctx else ""
         out.append((mid, _pretty(mid, m.get("name")), hint))
     out.sort(key=lambda e: e[1].lower())
+    return out
+
+
+def _fetch_fcc():
+    """Catalogue de FCC : « fournisseur/modele », deja filtre par lui.
+
+    Il n'expose pas /models mais son API d'administration, et ses entrees sont
+    des identifiants nus — le fournisseur sert d'indication.
+    """
+    try:
+        req = urllib.request.Request(FCC_BASE + "/admin/api/models",
+                                     headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode()).get("models") or []
+    except Exception:
+        return []
+    out = []
+    for mid in data:
+        mid = str(mid)
+        if not mid:
+            continue
+        prov, _, rest = mid.partition("/")
+        out.append((mid, _pretty(rest or mid, None), prov))
+    out.sort(key=lambda e: (e[2], e[1].lower()))
     return out
 
 
@@ -449,7 +515,7 @@ def models_for(pid):
     Le routeur relit la meme surcharge a chaud : changer un modele prend effet
     au message suivant, sans redemarrer ni rouvrir de session.
     """
-    table = dict(PROVIDERS[pid]["models"])
+    table = fcc_models() if pid == "fcc" else dict(PROVIDERS[pid]["models"])
     over = (state().get("models") or {}).get(pid)
     if isinstance(over, dict):
         allowed = {ref for ref, *_ in catalog(pid)}
@@ -566,6 +632,37 @@ def check(pid, timeout=25):
     repli precedent, qui basculait puis echouait en vol.
     """
     cfg = PROVIDERS[pid]
+    if pid == "fcc":
+        # FCC parle l'API Anthropic : /v1/messages, pas /chat/completions. Une
+        # vraie generation reste la seule preuve qu'il sert — un modele arrive
+        # en fin de vie rend un 410 sans que rien d'autre ne bouge (vu le
+        # 2026-08-26 sur llama-3.3-nemotron-super-49b).
+        payload = json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "dis OK"}],
+        }).encode()
+        req = urllib.request.Request(
+            FCC_BASE + "/v1/messages", data=payload, method="POST",
+            headers={"Content-Type": "application/json",
+                     "x-api-key": FCC_TOKEN,
+                     "anthropic-version": "2023-06-01",
+                     "User-Agent": UA})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                body = json.loads(e.read().decode())
+                det = (body.get("error") or {}).get("message") or ""
+            except Exception:
+                det = ""
+            head = det.splitlines()[0][:120] if det else ""
+            return False, ("FCC refuse (HTTP %d) %s" % (e.code, head)).strip()
+        except Exception as e:
+            return False, ("FCC injoignable (%s) — lance `fcc-server` ou son "
+                           "application" % type(e).__name__)
+        return True, "FCC sert %s" % models_for("fcc")["haiku"]
     if pid == "or":
         key = or_key()
         if not key:

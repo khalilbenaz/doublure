@@ -19,7 +19,7 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
                                       │                       compte 3 ─┘
                                       │      ▲
                                       │      └ /api/oauth/usage, sondé en fond
-                                      └──► zen ─► kilo ─► openrouter (gratuit)
+                                      └──► fcc ─► zen ─► kilo ─► or (gratuit)
                                            ▲       saturée ? la suivante
                                            │
                                            └─ seulement quand tous sont épuisés
@@ -33,7 +33,13 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
 - **La chaîne va jusqu'au bout.** Une passerelle gratuite saturée ne fait pas
   échouer la requête : la suivante est essayée, et celle qui vient de refuser
   est écartée quelques minutes. Le message part, quoi qu'il arrive.
-- **Zéro configuration.** Deux des trois passerelles ne demandent aucune clé.
+- **Free Claude Code en tête de chaîne.** S'il tourne en local (port 8082),
+  c'est lui qu'on essaie d'abord : il couvre une cinquantaine de fournisseurs,
+  entretient son propre catalogue et sa propre santé de modèles. Doublure ne
+  duplique pas ce travail — elle lui passe la requête telle quelle, en laissant
+  FCC faire sa correspondance opus/sonnet/haiku. S'il n'écoute pas, il est
+  simplement retiré de la chaîne, sans erreur.
+- **Zéro configuration.** Trois des quatre passerelles ne demandent aucune clé.
 - **Bascule à chaud, dans les deux sens.** Une session ouverte depuis six
   heures suit, sans redémarrer — changer de compte ne demande ni relogin ni
   nouvelle session. Quand le quota revient, le retour sur Claude est
@@ -67,7 +73,7 @@ forcer la main :
 ```bash
 dbl                    # état courant
 dbl on                 # forcer le repli (premier fournisseur joignable)
-dbl on kilo            # forcer un fournisseur précis
+dbl on fcc             # forcer un fournisseur précis (fcc, zen, kilo, or)
 dbl off                # revenir aux comptes Claude
 dbl accounts           # tes comptes Claude, leur état, celui qui sert
 dbl auto off           # désarmer le repli automatique

@@ -9,6 +9,7 @@ défaut.
 |---|---|---|
 | `DOUBLURE_PORT` | `8099` | Port du routeur. À changer si le port est pris, ou pour faire tourner une seconde installation sans qu'elle se batte avec la première. Doit être posé pour **le routeur et le CLI** : ils doivent désigner le même port. |
 | `OPENROUTER_API_KEY` | — | Clé OpenRouter. Cherchée d'abord dans l'environnement, puis dans `~/.doublure/.env`. |
+| `FCC_PORT` | `8082` | Port de Free Claude Code. Doit être posé pour **le routeur et le CLI**, comme `DOUBLURE_PORT`. |
 | `CLAUDE_OAUTH_CLIENT_ID` | découvert | Force l'identifiant client OAuth au lieu de le lire dans l'installation locale de Claude Code. Utile si le bundle `cli.js` est introuvable (installation exotique). |
 
 ## Fichiers
@@ -24,6 +25,9 @@ défaut.
 ~/.doublure/free-models.json   catalogue des modèles gratuits (cache 6 h)
 ~/.doublure/router.log     journal du routeur
 ~/.doublure/install.log    journal du hook SessionStart
+
+~/.fcc/.env                config de Free Claude Code : lue, jamais écrite par
+                           doublure. Se modifie chez lui, par son /admin.
 ```
 
 ## `state.json`
@@ -33,13 +37,13 @@ main marche, mais `dbl` est plus sûr.
 
 | Clé | Type | Sens |
 |---|---|---|
-| `mode` | `"native"` \| `"zen"` \| `"kilo"` \| `"or"` | Amont courant. |
+| `mode` | `"native"` \| `"fcc"` \| `"zen"` \| `"kilo"` \| `"or"` | Amont courant. |
 | `auto` | booléen | Le repli automatique est-il armé. |
 | `since` | époque | Depuis quand ce mode. |
 | `reason` | texte | Pourquoi. Commence par `"auto"` si c'est le dispositif qui a décidé — **c'est ce préfixe qui autorise le chien de garde à défaire la bascule**. `"manuel"` est intouchable. |
 | `lastError` | texte | Dernier échec rencontré, pour affichage. |
 | `retryNativeAt` | époque | À partir de quand retenter Anthropic. `0` = jamais programmé. Passé cette date, le retour n'a lieu que si le relevé de quota le confirme ; sinon elle est repoussée. |
-| `chain` | liste | Ordre d'essai des fournisseurs. Absent = `["zen", "kilo", "or"]`. |
+| `chain` | liste | Ordre d'essai des fournisseurs. Absent = `["fcc", "zen", "kilo", "or"]`. `fcc` est retiré à la volée si rien n'écoute sur son port. |
 | `models` | objet | Surcharges de modèles, par fournisseur (voir plus bas). |
 | `account` | texte | Compte Claude à utiliser. Absent ou `null` = rotation automatique. Un compte au repos est sauté même s'il est nommé ici. |
 
@@ -136,6 +140,34 @@ Le catalogue est relu chez la passerelle (`/models`), filtré sur le suffixe
 force la relecture. Si la passerelle ne répond pas, le dernier bon cache sert ;
 à défaut, une liste validée à la main — le dispositif ne doit jamais se
 retrouver avec zéro modèle proposable juste parce qu'un `/models` a expiré.
+
+## Free Claude Code
+
+FCC est le premier maillon de la chaîne quand il tourne. Ce n'est pas une
+passerelle comme les autres : il parle déjà l'API Anthropic et fait sa propre
+correspondance de modèles. Doublure lui transmet donc le nom de modèle **tel
+que Claude Code l'a demandé** (`claude-opus-…`, `claude-haiku-…`) et ne
+retouche que l'authentification — `x-api-key: doublure` à la place du jeton
+OAuth, et `anthropic-beta` débarrassé de sa partie `oauth-…`, qu'un amont non
+Anthropic refuse.
+
+La correspondance vit chez FCC, dans `~/.fcc/.env` :
+
+| Clé | Rôle |
+|---|---|
+| `MODEL` | défaut, quand aucun alias ne correspond |
+| `MODEL_OPUS` / `MODEL_SONNET` / `MODEL_HAIKU` / `MODEL_FABLE` | un par palier demandé par Claude Code |
+| `MODEL_FALLBACKS` | cascade **interne** à FCC, chaîne séparée par des virgules (pas un tableau JSON) |
+
+`dbl models` affiche ces valeurs à chaud, sans les recopier : changer la config
+chez FCC suffit, il n'y a rien à resynchroniser ici. `MODEL_FALLBACKS` mérite
+d'être rempli — laissé vide, un modèle arrivé en fin de vie fait répondre `410`
+sans qu'aucune reprise n'ait lieu côté FCC ; la requête retombe alors sur le
+maillon suivant de doublure, ce qui marche mais coûte un aller-retour.
+
+Si rien n'écoute sur le port, `fcc` est retiré de la chaîne pour la requête en
+cours — pas d'erreur, pas d'attente. Le résultat de la sonde est gardé 30
+secondes : un proxy qu'on relance est repris tout seul.
 
 ## La sonde de quota
 
