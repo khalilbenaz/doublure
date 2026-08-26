@@ -29,6 +29,9 @@ PY=$("$PY" -c 'import sys; print(sys.executable)')
 mkdir -p "$DEST" "$HOME/Library/LaunchAgents" || die "$DEST non creable"
 
 # --- sources -------------------------------------------------------------
+# Declare avant la boucle : `set -u` fait echouer le test plus bas si aucune
+# source n'a bouge, ou si l'installation tourne depuis $DEST lui-meme.
+changed=""
 if [ "$SRC" != "$DEST" ]; then
   for f in router.py bridge.py fallback.py statefile.py; do
     cmp -s "$SRC/$f" "$DEST/$f" ||
