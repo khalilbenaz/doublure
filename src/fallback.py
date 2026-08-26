@@ -173,6 +173,30 @@ def router_usage(timeout=2):
     return out
 
 
+def router_pool(timeout=2):
+    """Comptes du pool claude-swap, vus par le routeur.
+
+    Le routeur est la seule autorite : c'est lui qui lit le cache de
+    claude-swap, ecarte les slots dont l'entree de trousseau a disparu et
+    reconnait celui qui est deja le compte de la session. Recopier ce tri ici
+    donnerait deux verites qui divergent des que l'une bouge.
+    """
+    try:
+        with urllib.request.urlopen(f"{ROUTER_BASE}/__router",
+                                    timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        return []
+    out = []
+    for row in data.get("accounts") or ():
+        if isinstance(row, dict) and row.get("source") == "claude-swap":
+            out.append({"name": row.get("name"),
+                        "service": "claude-swap",
+                        "swapAccount": row.get("swapAccount"),
+                        "cooldownUntil": float(row.get("restUntil") or 0)})
+    return out
+
+
 def router_alive(timeout=2):
     try:
         with urllib.request.urlopen(f"{ROUTER_BASE}/__router", timeout=timeout) as r:
@@ -884,11 +908,16 @@ ACCOUNTS_FILE = os.path.join(DBL_DIR, "accounts.json")
 NAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 
 
-def keychain_read(service):
+def keychain_read(service, account=None):
+    """Lit une entree du trousseau. `account` vise une entree precise dans un
+    service partage : claude-swap y range tous ses comptes sous le meme nom de
+    service."""
+    cmd = ["security", "find-generic-password", "-s", service]
+    if account:
+        cmd += ["-a", account]
     try:
         out = subprocess.run(
-            ["security", "find-generic-password", "-s", service, "-w"],
-            capture_output=True, text=True, timeout=10)
+            cmd + ["-w"], capture_output=True, text=True, timeout=10)
     except Exception:
         return None
     if out.returncode != 0:
@@ -920,10 +949,13 @@ def accounts():
     out = []
     for item in (data.get("accounts") or []) if isinstance(data, dict) else []:
         if isinstance(item, dict) and item.get("name"):
-            out.append({"name": str(item["name"]),
-                        "service": item.get("service")
-                        or KEYCHAIN_PREFIX + str(item["name"]),
-                        "cooldownUntil": float(item.get("cooldownUntil") or 0)})
+            row = {"name": str(item["name"]),
+                   "service": item.get("service")
+                   or KEYCHAIN_PREFIX + str(item["name"]),
+                   "cooldownUntil": float(item.get("cooldownUntil") or 0)}
+            if item.get("swapAccount"):
+                row["swapAccount"] = str(item["swapAccount"])
+            out.append(row)
     return out
 
 
@@ -1000,11 +1032,18 @@ def accounts_use(name):
     if name in (None, "auto"):
         set_state(account=None)
         return 0, "choix du compte : automatique"
-    known = ["claude"] + [a["name"] for a in accounts()]
+    pool = {a["name"]: a for a in router_pool()}
+    known = ["claude"] + list(pool) + [a["name"] for a in accounts()]
     if name not in known:
         return 1, f"aucun compte « {name} » — connus : {', '.join(known)}"
-    service = KEYCHAIN_SERVICE if name == "claude" else KEYCHAIN_PREFIX + name
-    if not keychain_read(service):
+    if name in pool:
+        service = "claude-swap"
+        entry = pool[name].get("swapAccount")
+    else:
+        service = (KEYCHAIN_SERVICE if name == "claude"
+                   else KEYCHAIN_PREFIX + name)
+        entry = None
+    if not keychain_read(service, entry):
         return 1, f"le trousseau n'a plus l'entree du compte « {name} »"
     set_state(account=name)
     return 0, f"compte actif : {name} (immediat, sans relancer la session)"
@@ -1015,10 +1054,20 @@ def accounts_list():
     now = time.time()
     want = state().get("account")
     rows = [{"name": "claude", "service": KEYCHAIN_SERVICE, "cooldownUntil": 0}]
+    rows += router_pool()
+    known = {r["name"] for r in rows}
     for acc in accounts():
         if acc["service"] == KEYCHAIN_SERVICE or acc["name"] == "claude":
             rows[0]["cooldownUntil"] = acc["cooldownUntil"]
             continue
+        if acc["name"] in known:
+            # Un compte du pool mis au repos a une ligne dans accounts.json :
+            # c'est le repos qui compte, pas une seconde entree.
+            for r in rows:
+                if r["name"] == acc["name"]:
+                    r["cooldownUntil"] = acc["cooldownUntil"]
+            continue
+        known.add(acc["name"])
         rows.append(acc)
     # Le compte servi maintenant : celui demande s'il est libre, sinon le
     # premier qui l'est — meme regle que le routeur.
@@ -1035,7 +1084,7 @@ def accounts_list():
     seen = router_usage()
     out = []
     for row in rows:
-        blob = keychain_read(row["service"])
+        blob = keychain_read(row["service"], row.get("swapAccount"))
         rest = row["cooldownUntil"]
         if not blob:
             etat = "trousseau vide"
@@ -1047,6 +1096,8 @@ def accounts_list():
         if row["name"] in seen:
             pct, win = seen[row["name"]]
             bits.append(f"quota {pct:.0f} %" + (f" ({win})" if win else ""))
+        if row.get("service") == "claude-swap":
+            bits.append("claude-swap")
         bits.append(account_label(blob))
         out.append(f"{'*' if row['name'] == active else ' '} "
                    f"{row['name']:<14s} {etat:<16s} {' — '.join(bits)}")

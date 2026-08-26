@@ -65,7 +65,8 @@ date de fin de repos.
 | Clé | Sens |
 |---|---|
 | `name` | Ce que tu tapes dans `dbl accounts use <nom>`. Lettres, chiffres, `.`, `_`, `-`, 32 caractères max. |
-| `service` | Service du trousseau macOS où vit le jeton. `Doublure-<nom>` pour les comptes ajoutés ; `Claude Code-credentials` pour celui de la session. |
+| `service` | Service du trousseau macOS où vit le jeton. `Doublure-<nom>` pour les comptes ajoutés ; `Claude Code-credentials` pour celui de la session ; `claude-swap` pour ceux du pool. |
+| `swapAccount` | Entrée de trousseau visée à l'intérieur d'un service partagé (`account-<slot>-<adresse>`). Présente seulement pour les comptes venus de claude-swap. |
 | `cooldownUntil` | Époque jusqu'à laquelle le compte est sauté. Posée soit par la sonde de quota (date de remise à zéro annoncée), soit par un `429` (en-tête `retry-after`). `0` = disponible. |
 
 Le compte nommé `claude` existe toujours, même absent du fichier : c'est
@@ -95,6 +96,40 @@ rejoué.
 `use` ne survit pas au repos : si le compte forcé rend un `429`, il est mis au
 repos et la rotation reprend. Pour rester sur un compte coûte que coûte, il n'y
 a rien — et c'est volontaire : refuser de servir une requête serait pire.
+
+## Les comptes de claude-swap
+
+Si [claude-swap](https://github.com/) gère un pool d'abonnements Claude, doublure
+le lit et l'ajoute derrière le compte de la session, **avant** tout modèle
+gratuit : un abonnement entier vaut mieux qu'un modèle libre, et le tenter ne
+coûte qu'une requête. C'était le défaut le plus coûteux du dispositif — il
+partait au gratuit alors qu'un autre abonnement était libre.
+
+La lecture est **en lecture seule** :
+
+```
+~/.claude-swap-backup/cache/usage.json   liste des slots (cache 60 s)
+trousseau, service « claude-swap »       un item par slot, jamais réécrit
+```
+
+Le jeton n'est jamais rafraîchi par doublure pour ces comptes : claude-swap
+tient son propre rafraîchissement, et deux écrivains sur la même entrée se
+marcheraient dessus. Doublure se contente donc du jeton en place — s'il est
+expiré, c'est au démon `claude-swap auto` de le renouveler.
+
+Deux tris à l'entrée, pour ne proposer que des comptes réels :
+
+- le slot dont le **jeton de rafraîchissement** est celui de la session est
+  écarté — c'est le même abonnement, le compter deux fois brûlerait son quota
+  deux fois dans le journal ;
+- un slot sans entrée de trousseau est écarté : le fichier de cache de
+  claude-swap garde des comptes retirés depuis, qui ne donneraient que des
+  `401`.
+
+Ces comptes apparaissent dans `dbl accounts` (mention `claude-swap`) et dans
+`/__router` (`"source": "claude-swap"`). `dbl accounts use swap2` marche comme
+pour les autres. Rien à configurer : ajouter un compte dans claude-swap suffit,
+doublure le voit au tour suivant.
 
 ## Changer l'ordre des fournisseurs
 

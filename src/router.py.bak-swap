@@ -530,19 +530,11 @@ def client_id():
     return found
 
 
-def read_keychain(service=KEYCHAIN_SERVICE, account=None):
-    """Lit une entree du trousseau.
-
-    `account` vise une entree precise a l'interieur d'un service partage :
-    claude-swap range tous ses comptes sous le meme service et les distingue
-    par leur compte (« account-1-... »).
-    """
-    cmd = ["security", "find-generic-password", "-s", service]
-    if account:
-        cmd += ["-a", account]
+def read_keychain(service=KEYCHAIN_SERVICE):
     try:
         out = subprocess.run(
-            cmd + ["-w"], capture_output=True, text=True, timeout=10)
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True, text=True, timeout=10)
     except Exception:
         return None
     if out.returncode != 0:
@@ -553,19 +545,12 @@ def read_keychain(service=KEYCHAIN_SERVICE, account=None):
         return None
 
 
-def write_keychain(blob, service=KEYCHAIN_SERVICE, account=None):
-    """Reecrit l'entree du trousseau (-U remplace celle qui existe).
-
-    Le pool de claude-swap est en lecture seule : il rafraichit ses jetons
-    lui-meme, et deux ecrivains sur la meme entree se marcheraient dessus.
-    """
-    if service == SWAP_SERVICE:
-        return
+def write_keychain(blob, service=KEYCHAIN_SERVICE):
+    """Reecrit l'entree du trousseau (-U remplace celle qui existe)."""
     try:
         subprocess.run(
             ["security", "add-generic-password", "-U", "-s", service,
-             "-a", account or os.environ.get("USER", "claude"),
-             "-w", json.dumps(blob)],
+             "-a", os.environ.get("USER", "claude"), "-w", json.dumps(blob)],
             capture_output=True, text=True, timeout=10)
     except Exception as e:
         log(f"trousseau non reecrit : {type(e).__name__}")
@@ -592,13 +577,10 @@ def read_accounts():
     out = []
     for item in data.get("accounts") or ():
         if isinstance(item, dict) and item.get("name"):
-            row = {"name": str(item["name"]),
-                   "service": item.get("service")
-                   or KEYCHAIN_PREFIX + str(item["name"]),
-                   "cooldownUntil": float(item.get("cooldownUntil") or 0)}
-            if item.get("swapAccount"):
-                row["swapAccount"] = str(item["swapAccount"])
-            out.append(row)
+            out.append({"name": str(item["name"]),
+                        "service": item.get("service")
+                        or KEYCHAIN_PREFIX + str(item["name"]),
+                        "cooldownUntil": float(item.get("cooldownUntil") or 0)})
     return out
 
 
@@ -608,126 +590,24 @@ def write_accounts(accounts):
 
 
 def all_accounts():
-    """Tous les comptes Claude utilisables, dans l'ordre d'essai.
+    """Le compte de la session, puis ceux enregistres — sans doublon.
 
     Le premier est toujours celui auquel Claude Code est connecte : c'est le
-    comportement d'origine quand aucun compte n'a ete ajoute. Viennent ensuite
-    ceux de claude-swap, puis ceux ajoutes ici par `dbl accounts add`.
-
-    L'ordre a une raison : un compte du pool claude-swap est un abonnement
-    complet, il vaut mieux que n'importe quel modele gratuit, et le tenter ne
-    coute qu'une requete. Sans cette lecture, doublure basculait au gratuit
-    alors que le pool avait encore du quota.
+    comportement d'origine quand aucun compte n'a ete ajoute.
     """
     session = {"name": "claude", "service": KEYCHAIN_SERVICE,
                "cooldownUntil": 0}
     out = [session]
-    # La cle d'unicite est (service, entree) : le pool claude-swap range tous
-    # ses comptes sous un service unique, un dedoublonnage par service seul
-    # n'en garderait qu'un.
-    seen = {(KEYCHAIN_SERVICE, None)}
-    # Les noms servent au second dedoublonnage : mettre un compte du pool au
-    # repos lui cree une ligne dans accounts.json, et sans ce filtre elle
-    # reviendrait comme un compte a part entiere — vers un service de
-    # trousseau qui n'existe pas, donc un 401 garanti.
-    names = {"claude"}
-    rests = {a["name"]: a["cooldownUntil"] for a in read_accounts()}
-    for acc in swap_accounts():
-        key = (acc["service"], acc.get("swapAccount"))
-        if key in seen or acc["name"] in names:
-            continue
-        seen.add(key)
-        names.add(acc["name"])
-        # Le repos vit chez nous, pas chez claude-swap : c'est notre 429 qu'il
-        # traduit, pas le sien.
-        acc["cooldownUntil"] = rests.get(acc["name"], 0)
-        out.append(acc)
+    seen = {KEYCHAIN_SERVICE}
     for acc in read_accounts():
-        key = (acc["service"], acc.get("swapAccount"))
-        if key in seen or acc["name"] in names:
+        if acc["service"] in seen:
             # Le compte de la session a lui aussi un repos memorise : le
             # perdre ici le ferait reessayer en boucle sur son 429.
-            if acc["service"] == KEYCHAIN_SERVICE and acc["name"] == "claude":
+            if acc["service"] == KEYCHAIN_SERVICE:
                 session["cooldownUntil"] = acc["cooldownUntil"]
             continue
-        seen.add(key)
-        names.add(acc["name"])
+        seen.add(acc["service"])
         out.append(acc)
-    return out
-
-
-# --------------------------------------------------------------------------
-# Comptes geres par claude-swap
-# --------------------------------------------------------------------------
-# claude-swap tient son propre pool, dans un unique service de trousseau
-# « claude-swap » avec une entree par slot : « account-<n>-<email> ». Sans
-# cette lecture, doublure ne voyait que le compte de la session et partait au
-# modele gratuit alors qu'un autre abonnement Claude etait libre — c'est
-# exactement l'ordre inverse de ce qu'on veut.
-#
-# On lit, on n'ecrit jamais : le pool reste la propriete de claude-swap, qui
-# rafraichit ses jetons lui-meme. Un compte qu'il retire disparait tout seul
-# d'ici a la sonde suivante.
-SWAP_SERVICE = "claude-swap"
-SWAP_USAGE = os.path.join(HOME, ".claude-swap-backup", "cache", "usage.json")
-# Les entrees du trousseau ne sont pas listables sans mot de passe : on part
-# des slots declares dans le cache d'usage de claude-swap, seul index lisible.
-SWAP_TTL = 60.0
-_swap_cache = {"at": 0.0, "accounts": []}
-_swap_lock = threading.Lock()
-
-
-def swap_accounts():
-    """Comptes claude-swap utilisables, dans l'ordre de leurs slots.
-
-    Rend des dictionnaires de la meme forme que read_accounts() pour que le
-    reste du routeur n'ait pas a distinguer leur origine. Le nom porte son
-    slot (« swap1 ») : c'est ce qui apparait dans les journaux et dans
-    `dbl accounts`, et ca reste stable meme si l'email change de casse.
-    """
-    now = time.time()
-    with _swap_lock:
-        if now - _swap_cache["at"] < SWAP_TTL:
-            return list(_swap_cache["accounts"])
-    out = []
-    try:
-        with open(SWAP_USAGE) as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        data = {}
-    slots = (data.get("accounts") or {}) if isinstance(data, dict) else {}
-    # Le compte de la session est presque toujours l'un des slots — c'est
-    # claude-swap qui l'y a mis. On l'identifie par son jeton de
-    # rafraichissement, seule valeur stable commune aux deux entrees (ni
-    # l'adresse ni l'organisation ne figurent dans le blob de Claude Code) :
-    # sans ca, le meme abonnement serait tente deux fois, et son 429 compte
-    # comme un compte de plus brule dans le journal.
-    session = ((read_keychain() or {}).get("claudeAiOauth")
-               or {}).get("refreshToken")
-    for slot in sorted(slots, key=lambda s: (len(s), s)):
-        info = slots[slot] if isinstance(slots[slot], dict) else {}
-        email = info.get("email")
-        if not email:
-            continue
-        entry = "account-%s-%s" % (slot, email)
-        oauth = (read_keychain(SWAP_SERVICE, entry) or {}).get("claudeAiOauth")
-        if not oauth:
-            # Le fichier de cache de claude-swap garde des slots dont
-            # l'entree de trousseau a disparu (compte retire, trousseau
-            # nettoye). Les proposer ne donnerait que des 401, et ils
-            # apparaitraient comme des comptes disponibles dans `dbl`.
-            continue
-        if session and oauth.get("refreshToken") == session:
-            continue
-        out.append({
-            "name": "swap%s" % slot,
-            "service": SWAP_SERVICE,
-            "swapAccount": entry,
-            "email": email,
-            "cooldownUntil": 0,
-        })
-    with _swap_lock:
-        _swap_cache.update(at=now, accounts=list(out))
     return out
 
 
@@ -755,15 +635,11 @@ def set_active_account(name):
     update_state(account=name)
 
 
-def rest_account(name, until, account=None):
+def rest_account(name, until):
     """Met un compte au repos jusqu'a `until`.
 
     Le compte de la session n'echappe pas a la regle : son repos est garde
     dans le meme fichier, meme s'il n'a pas d'entree propre au depart.
-
-    `account` est le compte complet quand on l'a sous la main : la ligne creee
-    reprend alors son service et son entree de trousseau, au lieu du
-    « Doublure-<nom> » deduit du nom — faux pour un compte du pool claude-swap.
     """
     # Relecture et ecriture sous le meme verrou : la sonde de quota et une
     # requete qui prend un 429 mettent au repos en meme temps, et le repos
@@ -775,14 +651,10 @@ def rest_account(name, until, account=None):
                 acc["cooldownUntil"] = float(until)
                 break
         else:
-            row = {"name": name,
-                   "service": (account or {}).get("service")
-                   or (KEYCHAIN_SERVICE if name == "claude"
-                       else KEYCHAIN_PREFIX + name),
-                   "cooldownUntil": float(until)}
-            if (account or {}).get("swapAccount"):
-                row["swapAccount"] = account["swapAccount"]
-            accounts.insert(0, row)
+            accounts.insert(0, {"name": name,
+                                "service": KEYCHAIN_SERVICE if name == "claude"
+                                else KEYCHAIN_PREFIX + name,
+                                "cooldownUntil": float(until)})
         write_accounts(accounts)
 
 
@@ -794,7 +666,7 @@ def next_account(exclude, now=None):
             continue
         if acc["cooldownUntil"] > now:
             continue
-        if not read_keychain(acc["service"], acc.get("swapAccount")):
+        if not read_keychain(acc["service"]):
             # Entree disparue du trousseau (compte revoque, trousseau
             # nettoye) : on ne la propose pas, elle donnerait un 401.
             continue
@@ -823,23 +695,21 @@ def refresh_token(refresh):
         return json.loads(r.read().decode())
 
 
-def access_token(service=KEYCHAIN_SERVICE, account=None):
+def access_token(service=KEYCHAIN_SERVICE):
     """Jeton d'un compte, rafraichi si son echeance approche.
 
-    Le cache est indexe par (service, entree) : les comptes de claude-swap
-    partagent un service, et un cache par service seul leur ferait voler leur
-    jeton l'un a l'autre.
+    Le cache est indexe par service : deux comptes en rotation ne doivent pas
+    se voler leur jeton.
     """
     now = time.time()
-    key = (service, account)
     with _token_lock:
-        entry = _token_cache.get(key) or {}
+        entry = _token_cache.get(service) or {}
         # Cache court : le compte connecte peut changer a tout moment, on
         # veut le voir vite, mais pas relire le trousseau a chaque requete.
         if entry.get("token") and now - entry.get("at", 0) < 5:
             return entry["token"]
 
-    blob = read_keychain(service, account)
+    blob = read_keychain(service)
     if not blob:
         return None
     oauth = blob.get("claudeAiOauth") or {}
@@ -862,11 +732,11 @@ def access_token(service=KEYCHAIN_SERVICE, account=None):
                 if data.get("expires_in"):
                     oauth["expiresAt"] = int((now + data["expires_in"]) * 1000)
                 blob["claudeAiOauth"] = oauth
-                write_keychain(blob, service, account)
-                log(f"jeton OAuth rafraichi ({account or service})")
+                write_keychain(blob, service)
+                log(f"jeton OAuth rafraichi ({service})")
 
     with _token_lock:
-        _token_cache[key] = {"at": now, "token": token, "expires": expires}
+        _token_cache[service] = {"at": now, "token": token, "expires": expires}
     return token
 
 
@@ -874,21 +744,18 @@ def access_token(service=KEYCHAIN_SERVICE, account=None):
 # Quota annonce — /api/oauth/usage, sonde en tache de fond
 # --------------------------------------------------------------------------
 
-# Cle (service, entree de trousseau), pas le service seul : le pool
-# claude-swap range tous ses comptes sous un service unique, une cle par
-# service ferait lire a chaque compte le releve de son voisin.
-_usage_cache = {}          # (service, entree) -> {"at": ..., "data": ...}
+_usage_cache = {}          # service -> {"at": ..., "data": ...}
 _usage_lock = threading.Lock()
 
 
-def fetch_usage(service, account=None):
+def fetch_usage(service):
     """Taux d'utilisation du compte, tel qu'Anthropic le declare.
 
     Rend None si la question ne peut pas etre posee (pas de jeton, reseau,
     endpoint change). Ne jamais transformer un echec de sonde en repos : on
     laisserait un compte valide sur le banc pour une panne reseau.
     """
-    token = access_token(service, account)
+    token = access_token(service)
     if not token:
         return None
     req = urllib.request.Request(USAGE_URL, headers={
@@ -904,14 +771,14 @@ def fetch_usage(service, account=None):
     if not isinstance(data, dict):
         return None
     with _usage_lock:
-        _usage_cache[(service, account)] = {"at": time.time(), "data": data}
+        _usage_cache[service] = {"at": time.time(), "data": data}
     return data
 
 
-def usage_snapshot(service, account=None):
+def usage_snapshot(service):
     """Dernier releve connu, sans rien emettre. Perime au bout de 5 minutes."""
     with _usage_lock:
-        entry = _usage_cache.get((service, account))
+        entry = _usage_cache.get(service)
     if not entry or time.time() - entry["at"] > 5 * USAGE_POLL:
         return None
     return entry["data"]
@@ -971,7 +838,7 @@ def quota_still_full():
     now = time.time()
     soonest = None
     for acc in all_accounts():
-        data = usage_snapshot(acc["service"], acc.get("swapAccount"))
+        data = usage_snapshot(acc["service"])
         if data is None:
             return None
         spent, until, _, _ = usage_verdict(data)
@@ -998,7 +865,7 @@ def usage_watch():
         try:
             now = time.time()
             for acc in all_accounts():
-                data = fetch_usage(acc["service"], acc.get("swapAccount"))
+                data = fetch_usage(acc["service"])
                 if data is None:
                     continue
                 spent, until, name, pct = usage_verdict(data)
@@ -1011,7 +878,7 @@ def usage_watch():
                 # reecrire le fichier a chaque tour de sonde.
                 if acc["cooldownUntil"] >= until - USAGE_POLL:
                     continue
-                rest_account(acc["name"], until, acc)
+                rest_account(acc["name"], until)
                 log(f"quota annonce a {pct:.0f} % ({name}) sur le compte "
                     f"« {acc['name']} » — repos preventif "
                     f"{max(1, round((until - now) / 60))} min")
@@ -1413,15 +1280,7 @@ class Router(http.server.BaseHTTPRequestHandler):
                 row = {"name": a["name"],
                        "resting": a["cooldownUntil"] > now,
                        "restUntil": int(a["cooldownUntil"]) or None}
-                if a.get("swapAccount"):
-                    # Utile au diagnostic : un compte venu du pool
-                    # claude-swap n'apparait dans aucun de nos fichiers.
-                    row["source"] = "claude-swap"
-                    row["email"] = a.get("email")
-                    # L'entree de trousseau, pas son contenu : le CLI en a
-                    # besoin pour lire le bon compte dans un service partage.
-                    row["swapAccount"] = a["swapAccount"]
-                seen = usage_snapshot(a["service"], a.get("swapAccount"))
+                seen = usage_snapshot(a["service"])
                 if seen:
                     _, _, win, pct = usage_verdict(seen)
                     row["usage"] = round(pct, 1)
@@ -1434,8 +1293,7 @@ class Router(http.server.BaseHTTPRequestHandler):
                     "upstream": "api.anthropic.com",
                     "account": acc["name"],
                     "accounts": accounts,
-                    "hasToken": bool(access_token(acc["service"],
-                                                  acc.get("swapAccount"))),
+                    "hasToken": bool(access_token(acc["service"])),
                 })
             if mode in BRIDGES:
                 cfg = BRIDGES[mode]
@@ -1531,7 +1389,7 @@ class Router(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
         conn.close()
-        rest_account(account["name"], due, account)
+        rest_account(account["name"], due)
         log(f"429 sur le compte « {account['name']} » — repos "
             f"{max(1, round((due - time.time()) / 60))} min")
 
@@ -1573,7 +1431,7 @@ class Router(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 conn.close()
-                rest_account(nxt["name"], nxt_due, nxt)
+                rest_account(nxt["name"], nxt_due)
                 due = min(due, nxt_due)
                 tried.add(nxt["name"])
                 log(f"429 aussi sur « {nxt['name']} »")
@@ -1618,7 +1476,7 @@ class Router(http.server.BaseHTTPRequestHandler):
 
         if mode == "native":
             acc = account or active_account()
-            token = access_token(acc["service"], acc.get("swapAccount"))
+            token = access_token(acc["service"])
             if not token:
                 err = {"status": 503, "rest": 0,
                        "detail": f"aucun jeton OAuth pour le compte "

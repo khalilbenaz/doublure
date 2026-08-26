@@ -29,7 +29,8 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
   `/api/oauth/usage` donne le même fait à l'avance, avec la date de remise à
   zéro. Doublure le sonde une fois par minute, hors du chemin de tes requêtes.
 - **Plusieurs comptes Claude.** Rotation automatique, le compte épuisé se met
-  au repos, un vrai Opus avant tout modèle gratuit.
+  au repos, un vrai Opus avant tout modèle gratuit. Le pool de
+  [claude-swap](#le-pool-de-claude-swap) est lu tel quel : rien à recopier.
 - **La chaîne va jusqu'au bout.** Une passerelle gratuite saturée ne fait pas
   échouer la requête : la suivante est essayée, et celle qui vient de refuser
   est écartée quelques minutes. Le message part, quoi qu'il arrive.
@@ -116,8 +117,17 @@ compte * perso          pret             quota 18 % (five_hour) — max, jeton 5
 compte   boulot         repos 96 min     quota 97 % (five_hour) — max, jeton 41 min
 ```
 
-Enregistrer un compte, c'est nommer celui auquel Claude Code est connecté *à
-cet instant* :
+### Le pool de claude-swap
+
+Si claude-swap gère déjà plusieurs abonnements, il n'y a rien à réenregistrer :
+doublure lit son pool (en lecture seule) et le place derrière le compte de la
+session, **avant** le premier modèle gratuit. Un compte déjà connu — celui de la
+session — n'est pas compté deux fois, et un slot dont l'entrée de trousseau a
+disparu est ignoré plutôt que proposé pour un `401`. Détails et limites dans
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#les-comptes-de-claude-swap).
+
+Enregistrer un compte à la main, c'est nommer celui auquel Claude Code est
+connecté *à cet instant* :
 
 ```bash
 claude                        # connecté avec le compte A
