@@ -19,8 +19,8 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
                                       │                       compte 3 ─┘
                                       │      ▲
                                       │      └ /api/oauth/usage, sondé en fond
-                                      └──► fcc ─► zen ─► kilo ─► or (gratuit)
-                                           ▲       saturée ? la suivante
+                                      └──► nim ─► or ─► zen ─► kilo ─► … (gratuit)
+                                           ▲      saturé ? le suivant
                                            │
                                            └─ seulement quand tous sont épuisés
 ```
@@ -31,16 +31,17 @@ message, tu ne relances rien, tu ne redémarres pas ta session.
 - **Plusieurs comptes Claude.** Rotation automatique, le compte épuisé se met
   au repos, un vrai Opus avant tout modèle gratuit. Le pool de
   [claude-swap](#le-pool-de-claude-swap) est lu tel quel : rien à recopier.
-- **La chaîne va jusqu'au bout.** Une passerelle gratuite saturée ne fait pas
+- **La chaîne va jusqu'au bout.** Un fournisseur gratuit saturé ne fait pas
   échouer la requête : la suivante est essayée, et celle qui vient de refuser
   est écartée quelques minutes. Le message part, quoi qu'il arrive.
-- **Free Claude Code en tête de chaîne.** S'il tourne en local (port 8082),
-  c'est lui qu'on essaie d'abord : il couvre une cinquantaine de fournisseurs,
-  entretient son propre catalogue et sa propre santé de modèles. Doublure ne
-  duplique pas ce travail — elle lui passe la requête telle quelle, en laissant
-  FCC faire sa correspondance opus/sonnet/haiku. S'il n'écoute pas, il est
-  simplement retiré de la chaîne, sans erreur.
-- **Zéro configuration.** Trois des quatre passerelles ne demandent aucune clé.
+- **Quarante-quatre fournisseurs gratuits, à elle.** Doublure tient son propre
+  registre : les clés, les catalogues, la santé des modèles, et la
+  correspondance opus/sonnet/fable/haiku. Elle ne délègue ce travail à
+  personne — voir [Les fournisseurs gratuits](#les-fournisseurs-gratuits).
+- **Zéro configuration.** Trois fournisseurs sans plafond ne demandent aucune
+  clé. Si Free Claude Code est déjà installé, ses clés sont reprises telles
+  quelles (`dbl import-fcc`), en lecture seule, et son proxy local sert de
+  dernier maillon s'il écoute.
 - **Bascule à chaud, dans les deux sens.** Une session ouverte depuis six
   heures suit, sans redémarrer — changer de compte ne demande ni relogin ni
   nouvelle session. Quand le quota revient, le retour sur Claude est
@@ -74,19 +75,23 @@ forcer la main :
 ```bash
 dbl                    # état courant
 dbl on                 # forcer le repli (premier fournisseur joignable)
-dbl on fcc             # forcer un fournisseur précis (fcc, zen, kilo, or)
+dbl on nim             # forcer un fournisseur précis (dbl providers les liste)
 dbl off                # revenir aux comptes Claude
 dbl accounts           # tes comptes Claude, leur état, celui qui sert
 dbl auto off           # désarmer le repli automatique
-dbl models             # modèles servis par chaque fournisseur
-dbl probe              # re-sonder les catalogues gratuits
+dbl providers          # les 44 fournisseurs, ceux qui ont une clé, la chaîne
+dbl models nim         # les 4 paliers d'un fournisseur, et son catalogue
+dbl key nim sk-...     # poser une clé (sans valeur : dit juste si elle existe)
+dbl import-fcc         # reprendre les clés de Free Claude Code
+dbl probe nim          # sonder pour de vrai : répond-il, appelle-t-il un outil
+dbl model nim opus …   # forcer le modèle d'un palier
 dbl json               # état complet en JSON, pour un tableau de bord
 ```
 
 Sortie typique :
 
 ```
-mode    repli zen (opencode Zen)
+mode    repli opencode_zen (OpenCode Zen)
         opus    nemotron-3-ultra-free
         sonnet  nemotron-3-ultra-free
         fable   nemotron-3.5-lightning-free
@@ -160,34 +165,106 @@ clair — chaque compte vit dans le trousseau macOS, sous son propre service
 `Doublure-<nom>`, et `accounts.json` ne contient que des noms et des dates de
 repos. Détails dans [Sécurité](docs/SECURITE.md).
 
-## Les trois passerelles
+## Les fournisseurs gratuits
 
-Elles n'entrent en jeu qu'une fois **tous** tes comptes Claude au repos.
+Ils n'entrent en jeu qu'une fois **tous** tes comptes Claude au repos.
 
-| Ordre | Fournisseur | Clé | Plafond | Particularité |
-|---|---|---|---|---|
-| 1 | **opencode Zen** | non | aucun constaté | API OpenAI, traduite |
-| 2 | **Kilo** | non | aucun constaté | API OpenAI, catalogue plus large |
-| 3 | **OpenRouter** | oui | 50 req/jour (gratuit) | seul à parler l'API Anthropic |
-
-L'ordre est un ordre d'essai, pas un choix unique : si la première ne répond
-pas — saturée, en panne, réseau coupé — la requête part sur la deuxième, puis
-sur la troisième. Celle qui vient de refuser est mise au repos **5 minutes**
-(1 minute si c'était le réseau) pour ne pas repayer son échec à chaque message,
-et celle qui a répondu devient le nouveau premier maillon. L'erreur n'arrive au
-client qu'après les avoir toutes tentées.
-
-Les deux sans plafond passent d'abord. OpenRouter est le seul à comprendre
-`/v1/messages` nativement — donc le plus fidèle — mais son palier gratuit
-s'épuise en une session de travail, d'où sa dernière place. Sans clé, il quitte
-la chaîne : le tenter donnerait un `401` présenté comme une panne du repli
-alors que les autres auraient répondu.
-
-Pour l'activer :
+Doublure connaît **48 fournisseurs, dont 44 appelables** : les trois sans
+plafond ni clé, les grands agrégateurs (OpenRouter, Groq, Cerebras, NVIDIA
+NIM, Together, Fireworks, Mistral, Cohere…), et les serveurs locaux (Ollama,
+LM Studio, llama.cpp). Aucun n'est configuré d'avance : un fournisseur entre
+dans la chaîne quand il a une clé, ou qu'il n'en demande pas, ou — pour un
+serveur local — qu'il écoute **et** sert au moins un modèle.
 
 ```bash
-echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.doublure/.env
+dbl providers
 ```
+
+```
++ nvidia_nim     NVIDIA NIM             pret
++ opencode_zen   OpenCode Zen           pret
++ kilo           Kilo.ai                pret
++ opencode_go    OpenCode Go            pret
+  groq           Groq                   cle absente : GROQ_API_KEY
+  ollama         Ollama                 ecoute, aucun modele installe
+  lmstudio       LM Studio              n'ecoute pas (http://localhost:1234/v1)
++ or             OpenRouter             pret
++ fcc            Free Claude Code       ecoute
+
+* sert maintenant   + dans la chaine de repli
+```
+
+`*` sert maintenant, `+` est dans la chaîne. Les noms courts d'avant le
+registre marchent toujours : `nim`, `zen`, `go`, `or`.
+
+L'ordre est un ordre d'essai, pas un choix unique : si le premier ne répond
+pas — saturé, en panne, réseau coupé — la requête part sur le suivant. Celui
+qui vient de refuser est mis au repos **5 minutes** (1 minute si c'était le
+réseau), et celui qui a répondu devient le nouveau premier maillon. L'erreur
+n'arrive au client qu'après les avoir tous tentés.
+
+**Les trois sans clé passent en premier** parmi les gratuits, parce qu'ils
+n'ont ni plafond constaté ni configuration :
+
+| Fournisseur | Clé | Plafond | Particularité |
+|---|---|---|---|
+| **OpenCode Zen** | non | aucun constaté | API OpenAI, traduite |
+| **Kilo.ai** | non | aucun constaté | API OpenAI, catalogue plus large |
+| **OpenCode Go** | non | aucun constaté | API OpenAI, catalogue réduit |
+| **OpenRouter** | oui | 50 req/jour (gratuit) | seul à parler l'API Anthropic |
+
+OpenRouter est le seul à comprendre `/v1/messages` nativement — donc le plus
+fidèle — mais son palier gratuit s'épuise en une session de travail. Sans clé,
+il quitte la chaîne : le tenter donnerait un `401` présenté comme une panne du
+repli alors que les autres auraient répondu.
+
+### Poser une clé
+
+```bash
+dbl key or sk-or-...      # écrit dans ~/.doublure/.env, en 0600
+dbl key or                # dit « posee » ou « absente », jamais la valeur
+dbl import-fcc            # reprend celles de ~/.fcc/.env, sans jamais l'écrire
+```
+
+### Le choix du modèle
+
+Aucune liste n'est écrite en dur. Doublure interroge le catalogue du
+fournisseur (mis en cache 6 h), **écarte les variantes payantes** dès qu'une
+gratuite existe — un repli qui coûte n'a plus d'intérêt —, écarte ce qui n'est
+pas de la génération de texte (plongements, rerank, image, audio), puis déduit
+un palier par modèle à partir de sa taille annoncée et de sa famille.
+
+```bash
+dbl models nim
+```
+
+```
+opus    nvidia/nemotron-3-ultra-550b-a55b
+sonnet  nvidia/nemotron-3-ultra-550b-a55b
+fable   nvidia/nemotron-4-340b-instruct
+haiku   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning
+
+69 modeles servis par NVIDIA NIM
+  ...
+```
+
+Un modèle peut répondre et **ignorer les outils** : Claude Code ne s'en sert
+alors à rien. `dbl probe <fournisseur>` envoie une vraie requête avec un outil
+et note les deux faits séparément. Le relevé (7 jours si bon, 1 heure si
+cassé) **écarte** un modèle constaté mauvais, mais ne promeut jamais un modèle
+juste parce qu'il a été sondé — sinon un nano testé passerait devant un 550B
+qui ne l'a pas été.
+
+Pour forcer un modèle précis — il doit être dans le catalogue affiché
+ci-dessus :
+
+```bash
+dbl model nim opus nvidia/nemotron-3-ultra-253b
+dbl model nim reset       # rendre les modèles déduits
+```
+
+Le routeur relit l'état à chaud : la surcharge prend au message suivant, sans
+rouvrir de session.
 
 ## Documentation
 
@@ -213,7 +290,7 @@ echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.doublure/.env
   de quota). S'il change de forme, la sonde échoue en silence et Doublure
   retombe sur le `429` — jamais l'inverse : une sonde en panne ne met aucun
   compte au repos.
-- **Les passerelles gratuites ne servent que `/v1/messages`** (et le comptage
+- **Les fournisseurs gratuits ne servent que `/v1/messages`** (et le comptage
   de jetons, estimé localement). Le reste de l'API Anthropic répond `404` en
   mode repli.
 

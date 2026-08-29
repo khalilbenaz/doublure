@@ -15,7 +15,7 @@ message suivant.
 
 C'est la seule raison d'être du routeur. Tout le reste en découle.
 
-## Les quatre pièces
+## Les cinq pièces
 
 ```
 src/router.py     Proxy HTTP sur 127.0.0.1:8099. Décide de l'amont, réécrit
@@ -23,13 +23,17 @@ src/router.py     Proxy HTTP sur 127.0.0.1:8099. Décide de l'amont, réécrit
                   429, relaie en flux.
 src/bridge.py     Traduction Anthropic <-> OpenAI. Fonctions pures, aucun
                   état, aucun réseau — donc testable au doigt.
-src/fallback.py   État, catalogue de modèles, sondes, bascules, CLI `dbl`.
+src/providers.py  Le registre : 48 fournisseurs, où va la clé de chacun,
+                  leur catalogue de modèles, la santé de ces modèles, et la
+                  correspondance opus/sonnet/fable/haiku qui s'en déduit.
+src/fallback.py   État, sondes, bascules, CLI `dbl`. Ne connaît plus aucun
+                  modèle par cœur : il interroge le registre.
 src/statefile.py  Écriture atomique et verrou inter-processus des fichiers
-                  d'état. Partagé par les deux précédents, qui écrivent les
+                  d'état. Partagé par le routeur et le CLI, qui écrivent les
                   mêmes fichiers depuis deux processus différents.
 ```
 
-`install.sh` copie les quatre dans `~/.doublure`, écrit le LaunchAgent, et sert
+`install.sh` copie les cinq dans `~/.doublure`, écrit le LaunchAgent, et sert
 lui-même de hook `SessionStart`. `uninstall.sh` défait exactement ça.
 
 ## Le chemin d'une requête
@@ -60,13 +64,13 @@ router.py  do_POST
   │                                                             ││
   ├─ mode « or » ◄──────────────────────────────────────────────┘│
   │    direct("or")                                              │
-  │      or_body() : modèle → nvidia/...:free, chemin préfixé /api│
+  │      or_body() : modèle → un modèle gratuit, chemin préfixé /api│
   │      ──► openrouter.ai  (parle l'API Anthropic nativement)    │
   │                                                               │
-  └─ mode « fcc » / « zen » / « kilo » ◄─────────────────────────┘
+  └─ mode « fcc » ou un id du registre ◄────────────────────────┘
        bridged()
          bridge.to_openai(corps)      Anthropic → OpenAI
-         ──► passerelle /chat/completions
+         ──► fournisseur  /chat/completions
          bridge.stream_to_anthropic() OpenAI SSE → Anthropic SSE
   │
   ▼
@@ -144,7 +148,7 @@ Deux choses en font une reprise et pas un simple message d'erreur :
    Python le ferait patienter le temps d'un démarrage d'interpréteur.
 
 L'ordre compte : un vrai Opus sur un second abonnement vaut mieux qu'un modèle
-gratuit, donc **les comptes passent tous avant la première passerelle**. La date
+gratuit, donc **les comptes passent tous avant le premier fournisseur**. La date
 de retour au natif est celle du **premier compte à se libérer** (`min` des
 repos) : rester en repli plus longtemps que nécessaire coûte en qualité.
 
@@ -155,16 +159,21 @@ valeur `> 1e9` est une époque, sinon c'est un délai. Sans rien d'exploitable,
 
 ### La chaîne de repli, jusqu'au bout
 
-`chain()` rend une liste — `["fcc", "zen", "kilo", "or"]`, `fcc` élagué si le
-proxy local ne répond pas — et `serve_fallback()`
-l'essaie **maillon par maillon**. C'est nécessaire, pas décoratif : une
-passerelle gratuite est partagée par tout le monde, sa saturation est le cas
-courant. N'essayer que le premier maillon revenait à rendre son `429` au client
-alors que les deux autres auraient répondu — l'exact contraire de la promesse.
+`chain()` déduit la liste du registre — tout fournisseur dont la clé est posée,
+qui n'en demande pas, ou qui tourne en local et sert au moins un modèle, dans
+l'ordre de préférence, puis `fcc` s'il écoute — et `serve_fallback()` l'essaie
+**maillon par maillon**. C'est nécessaire, pas décoratif : un fournisseur
+gratuit est partagé par tout le monde, sa saturation est le cas courant.
+N'essayer que le premier maillon revenait à rendre son `429` au client alors
+que les suivants auraient répondu — l'exact contraire de la promesse.
+
+Un fournisseur sans clé n'entre pas dans la chaîne : le tenter dépenserait un
+aller-retour pour un `401` présenté comme une panne du repli. Même règle pour
+un serveur local éteint, ou allumé mais sans modèle installé.
 
 ```
 serve_fallback(path, body, order)
-  order          la passerelle en place d'abord, puis le reste de la chaîne
+  order          le fournisseur en place d'abord, puis le reste de la chaîne
   ├─ écarte celles au repos (toutes au repos ? on purge et on retente :
   │  mieux vaut réessayer que rendre une erreur)
   ├─ pour chacune : bridged() ou or_served() en mode « quiet »
@@ -174,7 +183,7 @@ serve_fallback(path, body, order)
                        Les autres sont dans le journal.
 ```
 
-Le repos d'une passerelle est **en mémoire seulement**, jamais dans
+Le repos d'un fournisseur est **en mémoire seulement**, jamais dans
 `state.json` : une indisponibilité de cinq minutes n'a pas à survivre au
 routeur. Il dure `PROVIDER_REST` (5 min) sur un `429` ou un `5xx`, et
 `PROVIDER_REST_NET` (60 s) sur une panne réseau — une coupure dure souvent
@@ -313,17 +322,29 @@ Les images sont converties en `data:` URI. Vers un modèle non multimodal, elles
 deviennent la note littérale `[image non transmise : modèle non multimodal]` —
 mieux qu'un plantage, et l'utilisateur comprend ce qui manque.
 
-`count_tokens` est estimé localement (`mots × 0,75`) : les passerelles n'ont pas
+`count_tokens` est estimé localement (`mots × 0,75`) : les fournisseurs n'ont pas
 cet endpoint, et un `404` casserait la compaction de contexte de Claude Code.
 
 ## La réécriture du nom de modèle, obligatoire
 
 Laissé tel quel, `claude-opus-5` envoyé à OpenRouter est servi **depuis le vrai
 Anthropic et facturé au crédit**. Le repli ne serait plus gratuit. Chaque alias
-est donc réécrit vers un modèle `:free` de la passerelle, toujours, sans
-exception. Les tables vivent dans les deux fichiers : `router.py` fait la
-réécriture réelle, `fallback.py` sert l'affichage et les sondes — elles doivent
-rester alignées.
+est donc réécrit vers un modèle gratuit du fournisseur, toujours, sans
+exception. La table n'est plus écrite en dur : `providers.tiers()` la déduit du
+catalogue, et `router.py` comme `fallback.py` la lisent **au même endroit** —
+plus deux tables à garder alignées.
+
+La déduction, en une phrase : on ne garde que les variantes gratuites quand il
+en existe, on écarte ce qui n'est pas de la génération de texte, on note ce qui
+reste sur la taille annoncée dans l'identifiant et la famille, la santé
+constatée écarte les modèles cassés ou sourds aux outils — sans jamais promouvoir
+un modèle au seul motif qu'il a été sondé —, et les quatre paliers prennent les
+mieux notés en fenêtres décroissantes.
+
+Un modèle qui répond mais **ignore les outils** est inutilisable par Claude
+Code. La sonde note donc les deux faits séparément, dans
+`~/.doublure/health.json` : 7 jours si bon, 1 heure si cassé, pour qu'un modèle
+qui revient soit repris de lui-même.
 
 ## L'état, et les deux façons de le corrompre
 
@@ -398,3 +419,33 @@ Le LaunchAgent est la voie normale (`RunAtLoad`, `KeepAlive`,
 installation, session SSH sans domaine graphique. `start_router()` retombe
 alors sur un `Popen` détaché : sans routeur, Claude Code n'a plus d'amont du
 tout, ce qui est bien pire que de ne pas passer par launchd.
+
+## Les tests
+
+```
+python3 -m unittest discover -s tests -t tests
+```
+
+Rien d'installé, rien de réseau, rien du `~/.doublure` de la machine : les
+seules sources extérieures du registre — le catalogue d'un fournisseur et la
+santé de ses modèles — sont remplacées par des dictionnaires en mémoire
+(`tests/helpers.py`), et les tests qui écrivent (clés, état, surcharges)
+travaillent dans un répertoire temporaire.
+
+Ce qu'ils tiennent, ce sont les décisions qu'on ne peut pas relire dans le
+code sans se tromper :
+
+- **la santé écarte, elle ne promeut pas** — un modèle sondé bon et un modèle
+  jamais testé partagent le même rang, sinon sonder un nano le ferait passer
+  devant un 550 B et le palier « opus » finirait servi par lui ;
+- **le plus petit palier n'est pas le plus petit modèle** — sous 15 B la
+  boucle à outils décroche, donc `_small()` cherche le plus petit *utile* ;
+- **un modèle sondé à la main ne survit que s'il est encore servi** — sinon la
+  table `SEED` rendrait un 404 ;
+- **le gratuit évince son jumeau payant** — un repli qui coûte n'a plus
+  d'intérêt, et le nom ne le dit pas au moment de l'appel ;
+- **les deux tables de noms courts doivent rester identiques** — le routeur et
+  la CLI lisent le même `state.json` ; si elles divergent, `dbl on zen`
+  désigne un autre fournisseur que celui que le routeur appelle ;
+- **un fournisseur sans clé est écarté, pas tenté** — son `401` serait
+  présenté au client comme une panne du repli.

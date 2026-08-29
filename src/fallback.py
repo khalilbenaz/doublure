@@ -2,15 +2,18 @@
 """Repli de Claude Code sur des modeles gratuits quand le quota est atteint.
 
 Claude Code n'a pas de plan B : quand la fenetre de quota est pleine, la
-session s'arrete net jusqu'a la reprise. Ce module en donne un — trois
-passerelles qui servent des modeles gratuits — et le rend automatique.
+session s'arrete net jusqu'a la reprise. Ce module en donne un — une
+quarantaine de fournisseurs de modeles gratuits, tenus par providers.py — et
+le rend automatique.
 
 Le montage tient en deux pieces :
 
   router.py   un routeur local (127.0.0.1:8099) sur lequel `settings.json`
               pointe en permanence. C'est lui qui decide, *a chaque requete*,
               d'aller chez Anthropic ou chez une passerelle gratuite.
-  ce module   l'etat, le catalogue des modeles et les bascules manuelles.
+  ce module   l'etat, l'affichage et les bascules manuelles.
+  providers.py le registre des fournisseurs : cles, catalogues, sante,
+              correspondance des paliers. Doublure ne delegue plus ce travail.
 
 Pourquoi un routeur plutot que reecrire `settings.json` : Claude Code ne relit
 ce fichier qu'au demarrage de session. Y ecrire le repli ne l'aurait applique
@@ -29,12 +32,15 @@ import re
 import subprocess
 import sys
 import time
+import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Pose a cote de ce fichier par l'installeur, comme router.py et bridge.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import statefile  # noqa: E402  (le chemin doit etre pose avant l'import)
+import providers  # noqa: E402  (le chemin doit etre pose avant l'import)
+import statefile  # noqa: E402
 
 HOME = os.path.expanduser("~")
 SETTINGS = os.path.join(HOME, ".claude", "settings.json")
@@ -283,7 +289,7 @@ def mode():
     session suivante. Le routeur rend l'etat effectif tout de suite.
     """
     cur = state().get("mode")
-    if cur in PROVIDERS:
+    if usable(cur):
         return cur
     # « fcc » designait autrefois OpenRouter ; c'est desormais un vrai
     # fournisseur (le proxy local), donc rendu par le test ci-dessus.
@@ -293,42 +299,93 @@ def mode():
 # --------------------------------------------------------------------------
 # Fournisseurs de repli
 # --------------------------------------------------------------------------
-# Trois passerelles servent des modeles gratuits. Elles ne se valent pas :
+# Le registre est dans providers.py : les fournisseurs, leurs cles, leur
+# catalogue de modeles et leur sante. Ce fichier n'en garde que ce que la
+# ligne de commande affiche.
 #
-#   zen  — opencode Zen, sans cle, sans plafond journalier constate ;
-#   kilo — passerelle Kilo, sans cle non plus, catalogue plus large ;
-#   or   — OpenRouter, seul a parler l'API Anthropic nativement, mais limite
-#          a 50 requetes/jour sous 10 credits achetes (1000 au-dela).
-#
-# D'ou l'ordre par defaut : les deux sans plafond d'abord, OpenRouter en
-# dernier recours puisque son quota s'epuise en une session de travail.
-#
-# Les tables de modeles doivent rester alignees sur celles du routeur : c'est
-# lui qui reecrit reellement le nom, ceci n'est que l'affichage et la sonde.
+# Une seule entree n'est pas dans le registre : Free Claude Code. Ce n'est
+# pas un fournisseur mais un proxy local qui parle deja l'API Anthropic —
+# donc un maillon de plus, en fin de chaine, jamais un fondement. S'il n'est
+# pas lance, il disparait de la chaine sans erreur.
 
-OR_MODELS = {
-    "opus":   "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "sonnet": "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "fable":  "nvidia/nemotron-3.5-lightning:free",
-    "haiku":  "nvidia/nemotron-3-nano-30b-a3b:free",
-}
+ALIASES = providers.TIERS
+FCC_LABEL = "Free Claude Code"
 
-ZEN_MODELS = {
-    "opus":   "nemotron-3-ultra-free",
-    "sonnet": "nemotron-3-ultra-free",
-    "fable":  "nemotron-3.5-lightning-free",
-    "haiku":  "nemotron-3.5-lightning-free",
-}
+# Noms courts d'avant le registre — la meme table que le routeur, pour que
+# `dbl on zen` continue de marcher et qu'un etat ancien pointe au bon endroit.
+# « open_router » y renvoie vers « or » : OpenRouter parle l'API Anthropic
+# nativement, donc plus fidelement que par la traduction.
+ALIAS_SHORT = {"zen": "opencode_zen", "go": "opencode_go", "nim": "nvidia_nim",
+               "open_router": "or", "openrouter": "or"}
 
-KILO_MODELS = {
-    "opus":   "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "sonnet": "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "fable":  "nvidia/nemotron-3-super-120b-a12b:free",
-    "haiku":  "nvidia/nemotron-3.5-lightning:free",
-}
+
+def resolve(pid):
+    return ALIAS_SHORT.get(pid, pid) if isinstance(pid, str) else pid
+
+
+def reg(pid):
+    """Id du registre derriere un mode. « or » est servi en API Anthropic par
+    le routeur, mais c'est le meme fournisseur au bout du fil."""
+    return "open_router" if pid == "or" else pid
+
+# Cloudflare refuse « Python-urllib » devant plusieurs passerelles : sans
+# agent explicite, la sonde revient en 403 sans rapport avec le service.
+UA = providers.UA
+
+
+def usable(pid):
+    """`pid` designe-t-il un fournisseur que doublure sait servir ?"""
+    if pid == "fcc":
+        return True
+    pid = reg(pid)
+    return pid in providers.CATALOG and providers.usable(pid)
+
+
+def label(pid):
+    if pid == "fcc":
+        return FCC_LABEL
+    return providers.label(reg(pid))
+
+
+def base(pid):
+    if pid == "fcc":
+        return FCC_BASE
+    return (providers.CATALOG.get(reg(pid)) or {}).get("base") or ""
+
+
+def needs_key(pid):
+    """Ce fournisseur reclame-t-il une cle qui n'est pas encore posee ?"""
+    pid = reg(pid)
+    if pid == "fcc" or pid not in providers.CATALOG:
+        return False
+    cfg = providers.CATALOG[pid]
+    if cfg.get("keyless") or cfg.get("local"):
+        return False
+    return not providers.key(pid)
+
+
+def fcc_up(ttl=30):
+    """Le proxy Free Claude Code ecoute-t-il ? Sonde TCP, en cache 30 s."""
+    now = time.time()
+    if now - _fcc_probe["at"] < ttl:
+        return _fcc_probe["up"]
+    url = urllib.parse.urlsplit(FCC_BASE)
+    up = False
+    try:
+        socket.create_connection((url.hostname or "127.0.0.1",
+                                  url.port or 8082), timeout=0.4).close()
+        up = True
+    except OSError:
+        pass
+    _fcc_probe.update(at=now, up=up)
+    return up
+
+
+_fcc_probe = {"at": 0.0, "up": False}
+
 
 def fcc_models():
-    """Table alias -> modele telle que FCC la sert, lue dans son .env.
+    """Table palier -> modele telle que FCC la sert, lue dans son .env.
 
     Figer ces noms ici les condamnerait a mentir : c'est le reglage de FCC
     (MODEL_OPUS, MODEL_SONNET...) qui decide, et il change depuis son propre
@@ -353,65 +410,10 @@ def fcc_models():
     return {a: out.get(a) or default or "(non configure)" for a in ALIASES}
 
 
-PROVIDERS = {
-    "fcc": {
-        "label": "Free Claude Code",
-        "base": FCC_BASE,
-        "models": {},          # lue a chaud par fcc_models()
-        "key": False,
-    },
-    "zen": {
-        "label": "opencode Zen",
-        "base": "https://opencode.ai/zen/v1",
-        "models": ZEN_MODELS,
-        "key": False,
-    },
-    "kilo": {
-        "label": "Kilo",
-        "base": "https://api.kilo.ai/api/gateway/v1",
-        "models": KILO_MODELS,
-        "key": False,
-    },
-    "or": {
-        "label": "OpenRouter",
-        "base": OR_BASE,
-        "models": OR_MODELS,
-        "key": True,
-    },
-}
-
-# FCC en tete : son catalogue est entretenu ailleurs qu'ici et il reessaie
-# lui-meme chez un autre fournisseur avant de rendre un echec. Suivent les
-# deux passerelles sans cle, puis OpenRouter et son quota journalier.
-CHAIN = ("fcc", "zen", "kilo", "or")
-
-# Catalogue des modeles gratuits : liste vivante, relue chez la passerelle.
-#
-# Figer une liste ici la condamne a vieillir — les passerelles ajoutent et
-# retirent des modeles gratuits en permanence. On interroge donc /models et
-# l'on ne garde que ce qui est gratuit, avec un cache disque pour ne pas
-# payer un aller-retour reseau a chaque affichage du dashboard.
-
-FREE_CACHE = os.path.join(DBL_DIR, "free-models.json")
-FREE_TTL = 6 * 3600
-
-# Repli si la passerelle ne repond pas : les modeles valides a la main.
-FALLBACK_CATALOG = {
-    "zen": [("nemotron-3-ultra-free", "Nemotron 3 Ultra", ""),
-            ("nemotron-3.5-lightning-free", "Nemotron 3.5 Lightning", "")],
-    "kilo": [("nvidia/nemotron-3-ultra-550b-a55b:free", "Nemotron 3 Ultra", ""),
-             ("nvidia/nemotron-3-super-120b-a12b:free", "Nemotron 3 Super", ""),
-             ("nvidia/nemotron-3.5-lightning:free", "Nemotron 3.5 Lightning", "")],
-    "or": [("nvidia/nemotron-3-ultra-550b-a55b:free", "Nemotron 3 Ultra", ""),
-           ("nvidia/nemotron-3.5-lightning:free", "Nemotron 3.5 Lightning", "")],
-}
-
-ALIASES = ("opus", "sonnet", "fable", "haiku")
-
 _FREE_ID = re.compile(r"[-:/]free$", re.I)
 
 
-def _pretty(mid, name):
+def _pretty(mid, name=None):
     """« NVIDIA: Nemotron 3 Ultra (free) » -> « Nemotron 3 Ultra ».
 
     Le prefixe editeur et le suffixe « (free) » sont deja portes par la carte
@@ -426,41 +428,6 @@ def _pretty(mid, name):
     lab = re.sub(r"\s*\(free\)\s*$", "", lab, flags=re.I)
     lab = lab.split(":", 1)[-1].strip() if ":" in lab else lab
     return lab or mid
-
-
-def _fetch_free(pid):
-    """Modeles gratuits declares par la passerelle. [] si elle ne repond pas."""
-    if pid == "fcc":
-        return _fetch_fcc()
-    cfg = PROVIDERS[pid]
-    headers = {"User-Agent": UA}
-    if cfg["key"]:
-        k = or_key()
-        if not k:
-            return []
-        headers["Authorization"] = f"Bearer {k}"
-    try:
-        req = urllib.request.Request(cfg["base"] + "/models", headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = json.loads(r.read().decode()).get("data") or []
-    except Exception:
-        return []
-
-    out = []
-    for m in data:
-        mid = str(m.get("id") or "")
-        if not mid:
-            continue
-        # Deux signaux : l'identifiant suffixe « :free » / « -free », et le
-        # drapeau isFree quand la passerelle le publie (Kilo). Un modele sans
-        # l'un des deux peut etre facture : on ne le propose pas.
-        if not (_FREE_ID.search(mid) or m.get("isFree") is True):
-            continue
-        ctx = m.get("context_length") or (m.get("top_provider") or {}).get("context_length")
-        hint = f"contexte {int(ctx) // 1000}k" if isinstance(ctx, (int, float)) and ctx else ""
-        out.append((mid, _pretty(mid, m.get("name")), hint))
-    out.sort(key=lambda e: e[1].lower())
-    return out
 
 
 def _fetch_fcc():
@@ -482,79 +449,65 @@ def _fetch_fcc():
         if not mid:
             continue
         prov, _, rest = mid.partition("/")
-        out.append((mid, _pretty(rest or mid, None), prov))
+        out.append((mid, _pretty(rest or mid), prov))
     out.sort(key=lambda e: (e[2], e[1].lower()))
     return out
 
 
-def _cache_read():
-    try:
-        with open(FREE_CACHE) as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return {}
-
-
 def catalog(pid, refresh=False):
-    """Modeles gratuits proposables pour `pid` : (id, nom, indication).
+    """Modeles proposables pour `pid` : (id, nom, indication).
 
-    Le cache disque evite d'interroger la passerelle a chaque rendu ; passer
-    refresh=True force la relecture (bouton « Vérifier » du dashboard).
+    Le registre tient le cache disque et le rafraichit en fond ; ici on ne
+    fait que l'habiller pour l'affichage.
     """
-    if pid not in PROVIDERS:
+    if pid == "fcc":
+        # FCC prefixe ses modeles par le fournisseur (« nim/meta/llama-... ») ;
+        # la note se lit quand meme sur l'identifiant, donc le meme filtre
+        # ecarte ici aussi plongements, rerank, image et audio.
+        return [e for e in _fetch_fcc() if providers._score(e[0]) > 0]
+    pid = reg(pid)
+    if pid not in providers.CATALOG:
         return []
-    cache = _cache_read()
-    entry = cache.get(pid) or {}
-    fresh = (not refresh
-             and entry.get("at", 0) + FREE_TTL > time.time()
-             and entry.get("models"))
-    if fresh:
-        return [tuple(e) for e in entry["models"]]
-
-    live = _fetch_free(pid)
-    if live:
-        cache[pid] = {"at": int(time.time()), "models": [list(e) for e in live]}
-        try:
-            statefile.write_json(FREE_CACHE, cache)
-        except OSError:
-            pass
-        return live
-    # La passerelle ne repond pas : on garde le dernier bon cache, sinon les
-    # modeles valides a la main — le dashboard ne doit jamais afficher zero
-    # choix juste parce qu'un /models a expire.
-    if entry.get("models"):
-        return [tuple(e) for e in entry["models"]]
-    return FALLBACK_CATALOG.get(pid, [])
+    # Meme regle que le registre : quand un fournisseur publie des variantes
+    # gratuites, on ne propose que celles-la. Offrir le jumeau payant du meme
+    # modele ferait facturer un repli dont tout l'interet est d'etre gratuit.
+    pool = providers._free_only(providers.models(pid, refresh))
+    # Les catalogues melangent generation et le reste : plongements, rerank,
+    # image, audio. Rien de tout ca ne peut tenir une session Claude Code, et
+    # les proposer noierait les modeles qui le peuvent.
+    out = [(mid, _pretty(mid), "") for mid in pool if providers._score(mid) > 0]
+    out.sort(key=lambda e: e[1].lower())
+    return out
 
 
 def refresh_catalog():
-    """Relit la liste des modeles gratuits chez chaque passerelle."""
-    counts = {pid: len(catalog(pid, refresh=True)) for pid in PROVIDERS}
-    return counts
+    """Relit la liste des modeles chez chaque fournisseur de la chaine."""
+    return {pid: len(catalog(pid, refresh=True)) for pid in chain()}
 
 
 def models_for(pid):
-    """Table alias -> modele du fournisseur, surcharges du dashboard appliquees.
+    """Table palier -> modele du fournisseur, surcharges appliquees.
 
     Le routeur relit la meme surcharge a chaud : changer un modele prend effet
     au message suivant, sans redemarrer ni rouvrir de session.
     """
-    table = fcc_models() if pid == "fcc" else dict(PROVIDERS[pid]["models"])
+    if pid == "fcc":
+        return fcc_models()
     over = (state().get("models") or {}).get(pid)
-    if isinstance(over, dict):
-        allowed = {ref for ref, *_ in catalog(pid)}
-        for alias, ref in over.items():
-            if alias in table and ref in allowed:
-                table[alias] = ref
-    return table
+    pid = reg(pid)
+    if pid not in providers.CATALOG:
+        return {a: "(inconnu)" for a in ALIASES}
+    table = providers.tiers(pid, over if isinstance(over, dict) else None)
+    return {a: table.get(a) or "(aucun)" for a in ALIASES}
 
 
 def set_model(pid, alias, ref):
     """Fixe le modele servi par `pid` pour `alias`. Renvoie (ok, detail)."""
-    if pid not in PROVIDERS:
+    pid = resolve(pid)
+    if not usable(pid) or pid == "fcc":
         return False, f"fournisseur inconnu : {pid}"
     if alias not in ALIASES:
-        return False, f"role inconnu : {alias}"
+        return False, f"palier inconnu : {alias}"
     names = {r: lab for r, lab, *_ in catalog(pid)}
     if ref not in names:
         return False, "modele hors catalogue"
@@ -563,64 +516,57 @@ def set_model(pid, alias, ref):
     tbl[alias] = ref
     over[pid] = tbl
     set_state(models=over)
-    return True, f"{PROVIDERS[pid]['label']} — {alias} sert {names[ref]}"
+    return True, f"{label(pid)} — {alias} sert {names[ref]}"
 
 
 def reset_models(pid):
-    """Rend au fournisseur ses modeles par defaut."""
+    """Rend au fournisseur ses modeles deduits du catalogue."""
+    pid = resolve(pid)
     over = dict(state().get("models") or {})
     if over.pop(pid, None) is None:
         return False, "aucune surcharge a annuler"
     set_state(models=over)
-    return True, f"{PROVIDERS[pid]['label']} : modeles par defaut retablis"
-
-
-
-# Cloudflare refuse « Python-urllib » devant Zen : sans agent explicite, la
-# sonde revient en 403 sans rapport avec la disponibilite du service.
-UA = "doublure/1.0"
+    return True, f"{label(pid)} : modeles par defaut retablis"
 
 
 def chain():
-    """Ordre d'essai des fournisseurs, personnalisable via l'etat."""
+    """Ordre d'essai des fournisseurs, personnalisable via l'etat.
+
+    Elle est deduite du registre : tout fournisseur dont la cle est posee (ou
+    qui n'en demande pas, ou qui tourne en local) y entre, dans l'ordre de
+    preference. FCC ferme la marche quand il ecoute.
+    """
+    order, seen = [], set()
+    for pid in [resolve(p) for p in providers.configured()]:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if pid != "or" or providers.key("open_router"):
+            order.append(pid)
+    if fcc_up():
+        order.append("fcc")
     custom = state().get("chain")
     if isinstance(custom, list):
-        keep = [p for p in custom if p in PROVIDERS]
+        custom = [resolve(p) for p in custom if isinstance(p, str)]
+        keep = [p for p in custom if p in order]
         if keep:
-            return keep + [p for p in CHAIN if p not in keep]
-    return list(CHAIN)
-
-
-def or_key():
-    """Cle OpenRouter — environnement, puis fichier .env de l'installation."""
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if key:
-        return key
-    for path in (ENV_FILE,) + LEGACY_ENV:
-        try:
-            with open(path) as fh:
-                for line in fh:
-                    if line.startswith("OPENROUTER_API_KEY="):
-                        val = line.split("=", 1)[1].strip().strip("\"'")
-                        if val:
-                            return val
-        except OSError:
-            continue
-    return None
+            return keep + [p for p in order if p not in keep]
+    return order or ["opencode_zen"]
 
 
 def or_quota(timeout=15):
-    """Plafond restant du palier gratuit : (restant, total, reset_epoch).
+    """Plafond restant du palier gratuit OpenRouter : (restant, total, reset).
 
     OpenRouter n'expose x-ratelimit-* que sur un 429. Tant qu'il reste du
     quota, on ne sait donc pas combien : (None, None, 0) veut dire « pas
     encore epuise », pas « inconnu et inquietant ».
     """
-    key = or_key()
-    if not key:
+    key = providers.key("open_router")
+    model = providers.pick("open_router", "haiku")
+    if not key or not model:
         return None, None, 0
     payload = json.dumps({
-        "model": OR_MODELS["haiku"],
+        "model": model,
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "."}],
     }).encode()
@@ -628,6 +574,7 @@ def or_quota(timeout=15):
         f"{OR_BASE}/messages", data=payload, method="POST",
         headers={"Authorization": f"Bearer {key}",
                  "Content-Type": "application/json",
+                 "User-Agent": UA,
                  "anthropic-version": "2023-06-01"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -637,6 +584,7 @@ def or_quota(timeout=15):
         if e.code != 429:
             return None, None, 0
         h = e.headers
+
         def num(name):
             try:
                 return int(h.get(name))
@@ -648,84 +596,81 @@ def or_quota(timeout=15):
         return None, None, 0
 
 
-def check(pid, timeout=25):
-    """(ok, detail) — ce fournisseur peut-il servir une requete maintenant ?
+def _check_fcc(timeout):
+    """FCC parle l'API Anthropic : /v1/messages, pas /chat/completions.
 
-    Une vraie generation, pas un ping : c'est le seul moyen de distinguer
-    « joignable » de « repond effectivement », et c'est ce qui manquait au
-    repli precedent, qui basculait puis echouait en vol.
+    Une vraie generation reste la seule preuve qu'il sert — un modele arrive
+    en fin de vie rend un 410 sans que rien d'autre ne bouge (vu le
+    2026-08-26 sur llama-3.3-nemotron-super-49b).
     """
-    cfg = PROVIDERS[pid]
-    if pid == "fcc":
-        # FCC parle l'API Anthropic : /v1/messages, pas /chat/completions. Une
-        # vraie generation reste la seule preuve qu'il sert — un modele arrive
-        # en fin de vie rend un 410 sans que rien d'autre ne bouge (vu le
-        # 2026-08-26 sur llama-3.3-nemotron-super-49b).
-        payload = json.dumps({
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 64,
-            "messages": [{"role": "user", "content": "dis OK"}],
-        }).encode()
-        req = urllib.request.Request(
-            FCC_BASE + "/v1/messages", data=payload, method="POST",
-            headers={"Content-Type": "application/json",
-                     "x-api-key": FCC_TOKEN,
-                     "anthropic-version": "2023-06-01",
-                     "User-Agent": UA})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:
-            try:
-                body = json.loads(e.read().decode())
-                det = (body.get("error") or {}).get("message") or ""
-            except Exception:
-                det = ""
-            head = det.splitlines()[0][:120] if det else ""
-            return False, ("FCC refuse (HTTP %d) %s" % (e.code, head)).strip()
-        except Exception as e:
-            return False, ("FCC injoignable (%s) — lance `fcc-server` ou son "
-                           "application" % type(e).__name__)
-        return True, "FCC sert %s" % models_for("fcc")["haiku"]
-    if pid == "or":
-        key = or_key()
-        if not key:
-            return False, "OPENROUTER_API_KEY absente de ~/.doublure/.env"
-        req = urllib.request.Request(
-            f"{OR_BASE}/key", headers={"Authorization": f"Bearer {key}",
-                                       "User-Agent": UA})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read().decode()).get("data") or {}
-        except urllib.error.HTTPError as e:
-            return False, f"OpenRouter refuse la cle (HTTP {e.code})"
-        except Exception as e:
-            return False, f"OpenRouter injoignable ({type(e).__name__})"
-        remaining, total, reset = or_quota()
-        if remaining == 0:
-            when = time.strftime("%H:%M", time.localtime(reset)) if reset else "?"
-            return False, f"quota gratuit epuise ({total}/jour) — retour a {when}"
-        tier = "gratuit" if data.get("is_free_tier") else "paye"
-        return True, f"OpenRouter joignable (palier {tier})"
-
     payload = json.dumps({
-        "model": models_for(pid)["haiku"],
-        "max_tokens": 800,
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 64,
         "messages": [{"role": "user", "content": "dis OK"}],
     }).encode()
     req = urllib.request.Request(
-        f"{cfg['base']}/chat/completions", data=payload, method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": UA})
+        FCC_BASE + "/v1/messages", data=payload, method="POST",
+        headers={"Content-Type": "application/json",
+                 "x-api-key": FCC_TOKEN,
+                 "anthropic-version": "2023-06-01",
+                 "User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        if e.code == 429:
-            return False, f"{cfg['label']} : plafond atteint (HTTP 429)"
-        return False, f"{cfg['label']} refuse la requete (HTTP {e.code})"
+        try:
+            body = json.loads(e.read().decode())
+            det = (body.get("error") or {}).get("message") or ""
+        except Exception:
+            det = ""
+        head = det.splitlines()[0][:120] if det else ""
+        return False, ("FCC refuse (HTTP %d) %s" % (e.code, head)).strip()
     except Exception as e:
-        return False, f"{cfg['label']} injoignable ({type(e).__name__})"
-    return True, f"{cfg['label']} joignable (sans cle)"
+        return False, ("FCC injoignable (%s) — lance `fcc-server` ou son "
+                       "application" % type(e).__name__)
+    return True, "FCC sert %s" % fcc_models()["haiku"]
+
+
+def check(pid, timeout=25, force=False):
+    """(ok, detail) — ce fournisseur peut-il servir une requete maintenant ?
+
+    Une vraie generation avec un outil, pas un ping : c'est le seul moyen de
+    distinguer « joignable » de « sert Claude Code », et c'est ce qui manquait
+    au repli precedent, qui basculait puis echouait en vol. Le releve est
+    garde par le registre — une sonde coute une requete, on ne la repaie pas a
+    chaque affichage. `timeout` n'est utilise que pour FCC : le registre a son
+    propre delai, un gros modele gratuit pouvant mettre une minute.
+    """
+    if pid == "fcc":
+        return _check_fcc(timeout)
+    model = models_for(pid).get("haiku")
+    pid = reg(pid)
+    if pid not in providers.CATALOG:
+        return False, f"fournisseur inconnu : {pid}"
+    why = (providers.CATALOG[pid].get("special") or "").strip()
+    if why:
+        return False, f"{label(pid)} : {why}"
+    if needs_key(pid):
+        env = providers.CATALOG[pid].get("env") or "la cle"
+        return False, f"{label(pid)} : {env} absente de ~/.doublure/.env"
+    if providers.CATALOG[pid].get("local") and not providers._local_up(pid):
+        return False, f"{label(pid)} n'ecoute pas en local"
+    if not model or model.startswith("("):
+        return False, f"{label(pid)} n'annonce aucun modele utilisable"
+    rep = providers.probe(pid, model, force=force)
+    code = rep.get("code") or 0
+    if code == 429:
+        return False, f"{label(pid)} : plafond atteint (HTTP 429)"
+    if not rep.get("ok"):
+        det = (rep.get("error") or "").splitlines()[0][:120]
+        return False, f"{label(pid)} refuse ({code or 'reseau'}) {det}".strip()
+    if not rep.get("tools"):
+        # Claude Code ne sait rien faire sans tool_use : un modele qui rend du
+        # beau texte mais ignore les outils bloquerait a la premiere lecture
+        # de fichier. Mieux vaut le declarer inapte tout de suite.
+        return False, f"{label(pid)} : {model} ignore les outils"
+    return True, "%s sert %s (%d ms)" % (label(pid), _pretty(model),
+                                         rep.get("ms") or 0)
 
 
 def pick(timeout=25):
@@ -742,7 +687,8 @@ def pick(timeout=25):
 # Conserves pour le dashboard, qui les appelle encore.
 def reachable(timeout=10):
     cur = mode()
-    return check(cur if cur in PROVIDERS else chain()[0], timeout)
+    order = chain()
+    return check(cur if usable(cur) else (order[0] if order else "fcc"), timeout)
 
 
 def server_alive():
@@ -773,9 +719,10 @@ def to_fcc(reason="", force_probe=False, provider=None):
     Sans `provider`, on prend le premier de la chaine qui repond vraiment.
     """
     if provider:
-        if provider not in PROVIDERS:
+        provider = resolve(provider)
+        if not usable(provider):
             return False, f"fournisseur inconnu : {provider}"
-        ok, detail = check(provider)
+        ok, detail = check(provider, force=True)
         pid = provider if ok else None
     else:
         pid, detail = pick()
@@ -823,48 +770,79 @@ def to_native(reason=""):
 # ---------------------------------------------------------------------------
 
 
+def peek(pid):
+    """Ce que l'on sait deja d'un fournisseur, sans depenser une requete.
+
+    Rend (ok, detail) ou (None, detail) quand rien n'a encore ete sonde. Le
+    tableau de bord liste toute la chaine : la sonder entierement couterait
+    une generation par fournisseur a chaque affichage, alors qu'un releve de
+    la semaine passee dit la meme chose.
+    """
+    if pid == "fcc":
+        return (True, "FCC ecoute") if fcc_up() else (False, "FCC n'ecoute pas")
+    model = models_for(pid).get("haiku")
+    pid = reg(pid)
+    if pid not in providers.CATALOG:
+        return False, f"fournisseur inconnu : {pid}"
+    why = (providers.CATALOG[pid].get("special") or "").strip()
+    if why:
+        return False, f"{label(pid)} : {why}"
+    if needs_key(pid):
+        env = providers.CATALOG[pid].get("env") or "la cle"
+        return False, f"{env} absente de ~/.doublure/.env"
+    if not model or model.startswith("("):
+        return False, "aucun modele utilisable annonce"
+    rep = providers.health(pid).get(model)
+    if not isinstance(rep, dict):
+        return None, f"{_pretty(model)} — pas encore sonde"
+    if rep.get("ok") and rep.get("tools"):
+        return True, "%s (%d ms)" % (_pretty(model), rep.get("ms") or 0)
+    if rep.get("ok"):
+        return False, f"{_pretty(model)} ignore les outils"
+    det = (rep.get("error") or "").splitlines()[0][:90]
+    return False, f"refus {rep.get('code') or 'reseau'} {det}".strip()
+
+
 def summary():
     """Etat complet pour l'affichage du dashboard."""
     st = state()
     cur = mode()
     order = chain()
 
-    # Le fournisseur actif est sonde en premier : c'est celui dont l'etat
-    # compte. Les autres suivent, pour que le dashboard montre le recours.
-    probe = [cur] if cur in PROVIDERS else []
-    probe += [p for p in order if p not in probe]
-
-    providers, first_ok = [], None
-    for pid in probe:
-        ok, detail = check(pid)
+    # Le fournisseur actif est le seul reellement sonde : c'est celui dont
+    # l'etat compte. Les autres sont rendus depuis le releve de sante, deja
+    # sur le disque — un tableau de bord ne doit pas declencher quarante
+    # generations pour s'afficher.
+    active_id = cur if usable(cur) else (order[0] if order else "fcc")
+    rows, first_ok = [], None
+    for pid in [active_id] + [p for p in order if p != active_id]:
+        ok, detail = check(pid) if pid == active_id else peek(pid)
         if ok and first_ok is None:
             first_ok = pid
-        providers.append({
+        rows.append({
             "id": pid,
-            "label": PROVIDERS[pid]["label"],
-            "base": PROVIDERS[pid]["base"],
-            "needsKey": PROVIDERS[pid]["key"],
+            "label": label(pid),
+            "base": base(pid),
+            "needsKey": needs_key(pid),
             "ok": ok,
             "detail": detail,
             "active": pid == cur,
+            "probed": pid == active_id,
             "models": models_for(pid),
-            "catalog": list(catalog(pid)),
-            "custom": bool((state().get("models") or {}).get(pid)),
+            "catalog": list(catalog(pid)) if pid == active_id else [],
+            "custom": bool((st.get("models") or {}).get(pid)),
         })
-    providers.sort(key=lambda p: order.index(p["id"]))
 
-    active_id = cur if cur in PROVIDERS else order[0]
-    active = PROVIDERS[active_id]
     active_models = models_for(active_id)
-    remaining, total, reset = or_quota() if cur == "or" else (None, None, 0)
-    refs = sorted(set(active_models.values()))
-    alive = next((p["ok"] for p in providers if p["id"] == (cur if cur in PROVIDERS else order[0])), False)
-    detail = next((p["detail"] for p in providers if p["id"] == (cur if cur in PROVIDERS else order[0])), "")
+    remaining, total, reset = or_quota() if active_id == "or" else (None, None, 0)
+    refs = sorted({r for r in active_models.values() if not r.startswith("(")})
+    alive = bool(rows and rows[0]["ok"])
+    detail = rows[0]["detail"] if rows else ""
 
     return {
         "mode": cur,
-        "provider": cur if cur in PROVIDERS else "",
-        "providers": providers,
+        "provider": cur if usable(cur) else "",
+        "providers": rows,
         "chain": order,
         "auto": bool(st.get("auto")),
         "since": st.get("since") or 0,
@@ -872,7 +850,7 @@ def summary():
         "lastError": st.get("lastError") or "",
         "alive": alive,
         "aliveDetail": detail,
-        "upstream": active["base"],
+        "upstream": base(active_id),
         # Plafond du palier gratuit, propre a OpenRouter. remaining vaut None
         # tant qu'il en reste : le quota n'est chiffre que sur un 429.
         "quota": {"remaining": remaining, "total": total, "reset": reset},
@@ -1135,7 +1113,65 @@ def main():
             print(note)
         sys.exit(code)
     elif cmd == "probe":
+        # Sans argument : le premier de la chaine qui repond, comme avant.
+        # Avec : on force la sonde d'un fournisseur precis, releve de sante
+        # perime compris — c'est le seul moyen de rendre son verdict a un
+        # fournisseur mis de cote une heure plus tot.
+        if arg:
+            ok, note = check(resolve(arg), force=True)
+            print(note)
+            sys.exit(0 if ok else 1)
         print(ensure_models(force_probe=True)[1])
+    elif cmd in ("providers", "prov"):
+        order = chain()
+        for pid in providers.PREFERENCE + ("or", "fcc"):
+            if pid in ("open_router",) or not usable(pid):
+                continue
+            mark = "*" if pid == mode() else ("+" if pid in order else " ")
+            if pid == "fcc":
+                note = "ecoute" if fcc_up() else "arrete"
+            elif needs_key(pid):
+                note = "cle absente : " + (providers.CATALOG[reg(pid)]
+                                           .get("env") or "?")
+            elif (providers.CATALOG[reg(pid)].get("special") or ""):
+                note = providers.CATALOG[reg(pid)]["special"]
+            elif providers.CATALOG[reg(pid)].get("local"):
+                # Un serveur local n'a pas de cle a poser : ce qui decide,
+                # c'est qu'il tourne. Le dire « pret » quand il est eteint
+                # ferait chercher une cle qui n'existe pas.
+                if not providers._local_up(reg(pid)):
+                    note = "n'ecoute pas (%s)" % providers.CATALOG[reg(pid)]["base"]
+                elif not providers.models(reg(pid)):
+                    note = "ecoute, aucun modele installe"
+                else:
+                    note = "ecoute"
+            else:
+                note = "pret"
+            print(f"{mark} {pid:14s} {label(pid):22s} {note}")
+        print("\n* sert maintenant   + dans la chaine de repli")
+    elif cmd == "key":
+        # La cle est ecrite dans ~/.doublure/.env en 0600. Sans valeur, on dit
+        # seulement si elle est posee : l'afficher serait la publier dans
+        # l'historique du terminal.
+        who = resolve(arg) if arg else None
+        val = sys.argv[3] if len(sys.argv) > 3 else None
+        if not who or not usable(who) or who == "fcc":
+            print("usage : dbl key <fournisseur> [cle]")
+            sys.exit(1)
+        if not val:
+            print(f"{label(who)} : cle "
+                  f"{'posee' if providers.key(reg(who)) else 'absente'}")
+            sys.exit(0)
+        providers.set_key(reg(who), val)
+        ok, note = check(who, force=True)
+        print(f"{label(who)} — {note}")
+        sys.exit(0 if ok else 1)
+    elif cmd == "import-fcc":
+        got = providers.import_fcc_keys()
+        if not got:
+            print("aucune cle a reprendre dans ~/.fcc/.env")
+        else:
+            print("reprises : " + ", ".join(sorted(got)))
     elif cmd == "install":
         # Idempotent : rejoue a chaque demarrage de session par le hook.
         # Les deux doivent tourner : chainer par `or` ferait sauter le second
@@ -1147,10 +1183,43 @@ def main():
         sys.exit(0 if ok else 1)
     elif cmd == "json":
         print(json.dumps(summary(), indent=1, ensure_ascii=False))
+    elif cmd == "model":
+        # Surcharger un palier, ou rendre au fournisseur ses modeles deduits.
+        # Le routeur relit l'etat a chaud : la surcharge prend au message
+        # suivant, sans rouvrir de session.
+        alias = sys.argv[3] if len(sys.argv) > 3 else None
+        ref = sys.argv[4] if len(sys.argv) > 4 else None
+        if not arg or not alias:
+            print("usage : dbl model <fournisseur> <opus|sonnet|fable|haiku> "
+                  "<modele>\n        dbl model <fournisseur> reset")
+            sys.exit(1)
+        if alias == "reset":
+            ok, note = reset_models(arg)
+        elif not ref:
+            print("modele manquant — dbl models %s pour le catalogue" % arg)
+            sys.exit(1)
+        else:
+            ok, note = set_model(arg, alias, ref)
+        print(note)
+        sys.exit(0 if ok else 1)
     elif cmd == "models":
+        # Avec un fournisseur : son catalogue complet, pas seulement les
+        # quatre paliers — c'est ce qu'il faut pour choisir une surcharge.
+        if arg:
+            pid = resolve(arg)
+            if not usable(pid):
+                print(f"fournisseur inconnu : {arg}")
+                sys.exit(1)
+            for alias, ref in models_for(pid).items():
+                print(f"{alias:7s} {ref}")
+            cat = catalog(pid)
+            print(f"\n{len(cat)} modeles servis par {label(pid)}")
+            for mid, name, hint in cat:
+                print(f"  {mid:52s} {name} {hint}".rstrip())
+            sys.exit(0)
         for pid in chain():
             mark = "*" if pid == mode() else " "
-            print(f"{mark} {pid:5s} {PROVIDERS[pid]['label']}")
+            print(f"{mark} {pid:14s} {label(pid)}")
             for alias, ref in models_for(pid).items():
                 print(f"      {alias:7s} {ref}")
     else:
@@ -1159,7 +1228,7 @@ def main():
         if cur == "native":
             print("mode    native — comptes Claude")
         else:
-            print(f"mode    repli {cur} ({PROVIDERS[cur]['label']})")
+            print(f"mode    repli {cur} ({label(cur)})")
             for alias, ref in models_for(cur).items():
                 print(f"        {alias:7s} {ref}")
         # Les comptes sont montres dans les deux cas : en repli, c'est la

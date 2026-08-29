@@ -33,7 +33,7 @@ mkdir -p "$DEST" "$HOME/Library/LaunchAgents" || die "$DEST non creable"
 # source n'a bouge, ou si l'installation tourne depuis $DEST lui-meme.
 changed=""
 if [ "$SRC" != "$DEST" ]; then
-  for f in router.py bridge.py fallback.py statefile.py; do
+  for f in router.py bridge.py fallback.py statefile.py providers.py; do
     cmp -s "$SRC/$f" "$DEST/$f" ||
       { cp "$SRC/$f" "$DEST/$f" && changed=1 && say "copie $f"; }
   done
@@ -133,7 +133,8 @@ if [ "$QUIET" = 0 ]; then
   dbl                    etat courant
   dbl accounts add <nom> enregistrer le compte Claude connecte
   dbl accounts           tes comptes, et celui qui sert
-  dbl on [fcc|zen|kilo|or]  forcer un repli
+  dbl providers          les fournisseurs, ceux qui ont une cle
+  dbl on [fournisseur]   forcer un repli
   dbl off                revenir aux comptes Claude
   dbl auto off           desarmer le repli automatique
 

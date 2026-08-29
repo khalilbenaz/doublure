@@ -8,7 +8,7 @@ défaut.
 | Variable | Défaut | Effet |
 |---|---|---|
 | `DOUBLURE_PORT` | `8099` | Port du routeur. À changer si le port est pris, ou pour faire tourner une seconde installation sans qu'elle se batte avec la première. Doit être posé pour **le routeur et le CLI** : ils doivent désigner le même port. |
-| `OPENROUTER_API_KEY` | — | Clé OpenRouter. Cherchée d'abord dans l'environnement, puis dans `~/.doublure/.env`. |
+| `<PROV>_API_KEY` | — | Clé d'un fournisseur (`OPENROUTER_API_KEY`, `GROQ_API_KEY`, `NVIDIA_NIM_API_KEY`…). Cherchée dans l'environnement, puis `~/.doublure/.env`, puis `~/.fcc/.env`. `dbl providers` nomme la variable attendue par chacun. L'environnement passe devant : `GROQ_API_KEY=… dbl probe groq` teste une clé sans l'écrire. |
 | `FCC_PORT` | `8082` | Port de Free Claude Code. Doit être posé pour **le routeur et le CLI**, comme `DOUBLURE_PORT`. |
 | `CLAUDE_OAUTH_CLIENT_ID` | découvert | Force l'identifiant client OAuth au lieu de le lire dans l'installation locale de Claude Code. Utile si le bundle `cli.js` est introuvable (installation exotique). |
 
@@ -20,14 +20,16 @@ défaut.
 ~/.doublure/state.lock     verrou des deux fichiers ci-dessus, partagé par le
                            routeur et le CLI (vide, jamais lu — seul son
                            `flock` compte ; le supprimer est sans effet)
-~/.doublure/.env           OPENROUTER_API_KEY=sk-or-...
+~/.doublure/.env           les clés des fournisseurs, en 0600 (`dbl key`)
 ~/.doublure/client-id      identifiant client OAuth mis en cache
-~/.doublure/free-models.json   catalogue des modèles gratuits (cache 6 h)
+~/.doublure/catalog.json   catalogues de modèles par fournisseur (cache 6 h)
+~/.doublure/health.json    relevé de santé par modèle : répond-il, appelle-t-il
+                           un outil (7 j si bon, 1 h si cassé)
 ~/.doublure/router.log     journal du routeur
 ~/.doublure/install.log    journal du hook SessionStart
 
-~/.fcc/.env                config de Free Claude Code : lue, jamais écrite par
-                           doublure. Se modifie chez lui, par son /admin.
+~/.fcc/.env                config de Free Claude Code : lue en source de clés
+                           (`dbl import-fcc`), **jamais écrite** par doublure.
 ```
 
 ## `state.json`
@@ -37,13 +39,13 @@ main marche, mais `dbl` est plus sûr.
 
 | Clé | Type | Sens |
 |---|---|---|
-| `mode` | `"native"` \| `"fcc"` \| `"zen"` \| `"kilo"` \| `"or"` | Amont courant. |
+| `mode` | `"native"` \| `"fcc"` \| `"or"` \| un id du registre | Amont courant. Les anciens noms courts (`"zen"`, `"nim"`, `"go"`) sont encore acceptés et traduits à la lecture. |
 | `auto` | booléen | Le repli automatique est-il armé. |
 | `since` | époque | Depuis quand ce mode. |
 | `reason` | texte | Pourquoi. Commence par `"auto"` si c'est le dispositif qui a décidé — **c'est ce préfixe qui autorise le chien de garde à défaire la bascule**. `"manuel"` est intouchable. |
 | `lastError` | texte | Dernier échec rencontré, pour affichage. |
 | `retryNativeAt` | époque | À partir de quand retenter Anthropic. `0` = jamais programmé. Passé cette date, le retour n'a lieu que si le relevé de quota le confirme ; sinon elle est repoussée. |
-| `chain` | liste | Ordre d'essai des fournisseurs. Absent = `["fcc", "zen", "kilo", "or"]`. `fcc` est retiré à la volée si rien n'écoute sur son port. |
+| `chain` | liste | Ordre d'essai des fournisseurs. Absent = déduit du registre (tout fournisseur configuré, dans l'ordre de préférence, puis `fcc` s'il écoute). |
 | `models` | objet | Surcharges de modèles, par fournisseur (voir plus bas). |
 | `account` | texte | Compte Claude à utiliser. Absent ou `null` = rotation automatique. Un compte au repos est sauté même s'il est nommé ici. |
 
@@ -131,29 +133,77 @@ Ces comptes apparaissent dans `dbl accounts` (mention `claude-swap`) et dans
 pour les autres. Rien à configurer : ajouter un compte dans claude-swap suffit,
 doublure le voit au tour suivant.
 
+## Les clés des fournisseurs
+
+Doublure connaît 48 fournisseurs, dont 44 appelables. Aucun n'est actif
+d'avance : il entre dans la chaîne quand il a une clé, qu'il n'en demande pas,
+ou — pour un serveur local — qu'il écoute **et** sert au moins un modèle.
+
+```bash
+dbl providers             # tous, avec la variable attendue par chacun
+dbl key groq gsk_...      # écrit dans ~/.doublure/.env (0600), puis sonde
+dbl key groq              # « posee » ou « absente » — jamais la valeur
+dbl import-fcc            # reprend celles de ~/.fcc/.env, sans jamais l'écrire
+```
+
+`~/.doublure/.env` est un fichier `CLE=valeur` par ligne, créé en `0600` et
+réécrit de façon atomique. Rien ne le relit pour l'afficher : ni `/__router`
+ni `dbl key` ne rendent une valeur de clé.
+
+Quatre entrées du registre sont marquées `special` : leur authentification n'est
+pas une simple clé d'API (jeton de session, OAuth interactif). `dbl providers`
+dit pourquoi, au lieu de prétendre qu'il manque une clé.
+
 ## Changer l'ordre des fournisseurs
 
 ```bash
-python3 - <<'PY'
+python3 - <<'EOF'
 import json, os
 p = os.path.expanduser("~/.doublure/state.json")
 s = json.load(open(p))
-s["chain"] = ["kilo", "zen"]        # OpenRouter écarté, Kilo d'abord
+s["chain"] = ["kilo", "opencode_zen"]   # ces deux-là d'abord, puis le reste
 json.dump(s, open(p, "w"), indent=1)
-PY
+EOF
 ```
 
 Les fournisseurs inconnus sont ignorés ; ceux que tu omets sont remis à la
 fin, jamais perdus. `native` n'est pas un fournisseur de repli et se retire
-tout seul de la liste. Sans clé, `or` en sort aussi.
+tout seul de la liste. Un fournisseur sans clé en sort aussi : le tenter
+donnerait un `401` présenté comme une panne du repli alors qu'un autre aurait
+répondu.
 
 ## Changer les modèles
 
-Chaque fournisseur sert quatre rôles — `opus`, `sonnet`, `fable`, `haiku` — qui
-correspondent aux modèles que Claude Code demande. Pour voir l'existant :
+Chaque fournisseur sert quatre paliers — `opus`, `sonnet`, `fable`, `haiku` —
+qui correspondent aux modèles que Claude Code demande. Aucune liste n'est
+écrite en dur : ils sont **déduits du catalogue** du fournisseur.
 
 ```bash
-dbl models
+dbl models                # les paliers de chaque maillon de la chaîne
+dbl models nim            # ses paliers, puis son catalogue complet
+```
+
+La déduction, dans l'ordre :
+
+1. le catalogue est relu chez le fournisseur (`/models` ou son équivalent) et
+   mis en cache 6 h dans `~/.doublure/catalog.json` ;
+2. **si des variantes gratuites existent, seules celles-là sont retenues** —
+   un repli qui coûte n'a plus d'intérêt ;
+3. ce qui n'est pas de la génération de texte est écarté (plongements, rerank,
+   image, audio, détecteurs) ;
+4. chaque modèle reçoit une note tirée de la taille annoncée dans son
+   identifiant, de sa famille et des marqueurs d'usage (`instruct`, `coder`,
+   `reasoning`) ; les marqueurs disqualifiants (`embed`, `guard`…) l'écartent ;
+5. le relevé de santé **écarte** un modèle constaté cassé ou sourd aux outils,
+   mais ne promeut jamais un modèle juste parce qu'il a été sondé ;
+6. les quatre paliers prennent les mieux notés, en fenêtres décroissantes, et
+   une table de modèles vérifiés à la main passe devant s'il y en a une.
+
+Pour forcer un palier :
+
+```bash
+dbl model nim opus nvidia/nemotron-3-ultra-550b-a55b
+dbl model nim reset          # rendre les modèles déduits
 ```
 
 La surcharge vit dans `state.json`, sous `models` :
@@ -166,27 +216,40 @@ La surcharge vit dans `state.json`, sous `models` :
 }
 ```
 
-Deux garde-fous : l'alias doit exister, et le modèle doit être **dans le
-catalogue gratuit relu chez la passerelle**. Un identifiant hors catalogue est
-refusé — mieux vaut un refus net qu'une facturation surprise.
+Deux garde-fous : le palier doit exister, et le modèle doit être **dans le
+catalogue affiché par `dbl models <fournisseur>`**. Un identifiant hors
+catalogue est refusé — mieux vaut un refus net qu'une facturation surprise.
 
-Le catalogue est relu chez la passerelle (`/models`), filtré sur le suffixe
-`:free`/`-free` et le drapeau `isFree`, et mis en cache 6 heures. `dbl probe`
-force la relecture. Si la passerelle ne répond pas, le dernier bon cache sert ;
-à défaut, une liste validée à la main — le dispositif ne doit jamais se
-retrouver avec zéro modèle proposable juste parce qu'un `/models` a expiré.
+Le routeur relit la surcharge à chaud : elle prend au message suivant, sans
+rouvrir de session.
+
+## La santé des modèles
+
+Un modèle peut répondre et **ignorer les outils** — Claude Code ne s'en sert
+alors à rien. La sonde envoie une vraie requête avec un outil et note les deux
+faits séparément, dans `~/.doublure/health.json` : gardés 7 jours si bon,
+1 heure si cassé, pour qu'un modèle qui revient soit repris de lui-même.
+
+```bash
+dbl probe                 # le premier de la chaîne qui répond
+dbl probe nim             # forcer un fournisseur, relevé périmé compris
+```
+
+Rien ne sonde tout seul : ce serait des dizaines de requêtes pour rien. Les
+catalogues, eux, sont réchauffés en fond par le routeur toutes les 30 minutes
+(`CATALOG_POLL`, en tête de `router.py`) — hors du chemin de tes requêtes.
 
 ## Free Claude Code
 
-FCC est le premier maillon de la chaîne quand il tourne. Ce n'est pas une
-passerelle comme les autres : il parle déjà l'API Anthropic et fait sa propre
-correspondance de modèles. Doublure lui transmet donc le nom de modèle **tel
-que Claude Code l'a demandé** (`claude-opus-…`, `claude-haiku-…`) et ne
-retouche que l'authentification — `x-api-key: doublure` à la place du jeton
-OAuth, et `anthropic-beta` débarrassé de sa partie `oauth-…`, qu'un amont non
-Anthropic refuse.
+FCC ferme la chaîne quand il tourne. Ce n'est pas un fournisseur comme les
+autres : il parle déjà l'API Anthropic et fait sa propre correspondance de
+modèles. Doublure lui transmet donc le nom de modèle **tel que Claude Code l'a
+demandé** (`claude-opus-…`, `claude-haiku-…`) et ne retouche que
+l'authentification — `x-api-key: doublure` à la place du jeton OAuth, et
+`anthropic-beta` débarrassé de sa partie `oauth-…`, qu'un amont non Anthropic
+refuse.
 
-La correspondance vit chez FCC, dans `~/.fcc/.env` :
+Sa correspondance vit chez lui, dans `~/.fcc/.env` :
 
 | Clé | Rôle |
 |---|---|
@@ -194,15 +257,15 @@ La correspondance vit chez FCC, dans `~/.fcc/.env` :
 | `MODEL_OPUS` / `MODEL_SONNET` / `MODEL_HAIKU` / `MODEL_FABLE` | un par palier demandé par Claude Code |
 | `MODEL_FALLBACKS` | cascade **interne** à FCC, chaîne séparée par des virgules (pas un tableau JSON) |
 
-`dbl models` affiche ces valeurs à chaud, sans les recopier : changer la config
-chez FCC suffit, il n'y a rien à resynchroniser ici. `MODEL_FALLBACKS` mérite
-d'être rempli — laissé vide, un modèle arrivé en fin de vie fait répondre `410`
-sans qu'aucune reprise n'ait lieu côté FCC ; la requête retombe alors sur le
-maillon suivant de doublure, ce qui marche mais coûte un aller-retour.
+`dbl models fcc` affiche ces valeurs à chaud, sans les recopier. Le même
+fichier sert de source de clés à `dbl import-fcc` — en lecture seule :
+doublure n'y écrit jamais.
 
 Si rien n'écoute sur le port, `fcc` est retiré de la chaîne pour la requête en
 cours — pas d'erreur, pas d'attente. Le résultat de la sonde est gardé 30
 secondes : un proxy qu'on relance est repris tout seul.
+
+FCC n'est **pas** nécessaire : sans lui, la chaîne est celle du registre.
 
 ## La sonde de quota
 
@@ -228,20 +291,20 @@ Pour désarmer la prévoyance et ne garder que le `429` comme déclencheur, mett
 `launchctl kickstart -k gui/$(id -u)/com.doublure.router`. Un seuil plus bas
 (80 par exemple) bascule plus tôt, au prix de quota Claude laissé sur la table.
 
-## Le repos des passerelles gratuites
+## Le repos des fournisseurs gratuits
 
-Une passerelle qui vient de refuser est écartée quelques minutes, pour ne pas
+Un fournisseur qui vient de refuser est écarté quelques minutes, pour ne pas
 repayer son échec à chaque message. Deux constantes, en tête de `router.py` :
 
 | Constante | Défaut | Rôle |
 |---|---|---|
-| `PROVIDER_REST` | `300` s | Repos après un `429` ou un `5xx`. Court : ces passerelles sont partagées, une saturation passe vite. |
+| `PROVIDER_REST` | `300` s | Repos après un `429` ou un `5xx`. Court : ces services sont partagés, une saturation passe vite. |
 | `PROVIDER_REST_NET` | `60` s | Repos après une panne réseau ou un amont injoignable. Encore plus court : c'est souvent une coupure de quelques secondes. |
 
 Ce repos vit **en mémoire**, pas dans `state.json` : redémarrer le routeur le
-remet à zéro, et c'est voulu. Si toutes les passerelles sont au repos en même
+remet à zéro, et c'est voulu. Si tous les fournisseurs sont au repos en même
 temps, les repos sont purgés et la chaîne est retentée — rendre une erreur alors
-qu'une passerelle est peut-être revenue serait le mauvais choix.
+qu'un fournisseur est peut-être revenu serait le mauvais choix.
 
 ## Désarmer le repli automatique
 

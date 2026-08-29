@@ -82,8 +82,8 @@ Trois causes possibles, dans l'ordre de fréquence :
    aurait dupliqué une réponse commencée. C'est la limite du dispositif.
 2. **`auto` est désarmé.** `dbl auto on`. (La rotation de comptes, elle, a
    quand même eu lieu : `dbl accounts` le montre.)
-3. **Aucune passerelle ne répondait.** Les trois sont tentées avant qu'une
-   erreur remonte, donc c'est bien qu'aucune n'a pu servir. `dbl probe` le dit,
+3. **Aucun fournisseur ne répondait.** Toute la chaîne est tentée avant qu'une
+   erreur remonte, donc c'est bien qu'aucun n'a pu servir. `dbl probe` le dit,
    `lastError` dans `dbl` porte le détail, et le journal nomme chaque échec :
 
    ```bash
@@ -202,26 +202,53 @@ l'échéance retenue pour revenir au natif — la plus proche des deux. Dans ce 
 le repli est pris **sans même émettre la requête native** : le refus est déjà
 connu, l'aller-retour serait perdu.
 
-### « OPENROUTER_API_KEY absente »
+### « cle absente : XXX_API_KEY »
 
-Attendu si tu n'as pas de clé — OpenRouter quitte simplement la chaîne. Pour
-l'ajouter :
+Attendu : un fournisseur sans clé quitte simplement la chaîne, sans erreur.
+`dbl providers` nomme la variable attendue par chacun. Pour la poser :
 
 ```bash
-echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.doublure/.env
+dbl key groq gsk_...        # écrit ~/.doublure/.env en 0600, puis sonde
+dbl import-fcc              # ou reprendre celles de Free Claude Code
 ```
 
 ### « quota gratuit épuisé (50/jour) »
 
-Le palier gratuit d'OpenRouter est à bout pour la journée. Les deux autres
-passerelles n'ont pas de plafond constaté : `dbl on zen`.
+Le palier gratuit d'OpenRouter est à bout pour la journée. Les trois
+fournisseurs sans clé n'ont pas de plafond constaté : `dbl on zen`.
+
+### Tous les paliers d'un fournisseur montrent le même petit modèle
+
+Son catalogue est presque vide, ou tout ce qu'il contient a été écarté. Regarde
+ce qui reste vraiment proposable :
+
+```bash
+dbl models nim              # les paliers, puis le catalogue complet
+```
+
+Un catalogue anormalement court vient souvent d'un `/models` qui a répondu à
+moitié ; `dbl probe nim` force la relecture. Si le fournisseur ne publie que
+des variantes payantes, il n'a rien de gratuit à offrir : c'est voulu qu'il
+serve peu.
+
+### Un modèle répond mais n'appelle jamais d'outil
+
+Il est inutilisable par Claude Code, qui travaille par appels d'outils. La
+sonde note les deux faits séparément :
+
+```bash
+dbl probe nim               # « repond, ignore les outils » le dit explicitement
+```
+
+Le relevé (`~/.doublure/health.json`) écarte alors ce modèle du classement,
+pour 1 heure. Il est retenté ensuite : une panne passagère ne le condamne pas.
 
 ### Le modèle gratuit répond n'importe quoi, ou rien
 
 Les modèles gratuits sont nettement plus faibles. Certains renvoient du JSON
 d'appel d'outil malformé — la traduction le tolère, mais le résultat reste
-approximatif. Essaie un autre fournisseur (`dbl on kilo`), ou attends le retour
-du quota. C'est un filet, pas un remplacement.
+approximatif. Essaie un autre fournisseur (`dbl providers` les liste), ou
+attends le retour du quota. C'est un filet, pas un remplacement.
 
 ### Une image n'a pas été transmise
 
@@ -231,7 +258,7 @@ travaille sans la pièce jointe : ne t'attends pas à ce qu'il la commente.
 
 ### Une commande de l'API Anthropic répond `404` en mode repli
 
-Attendu. Les passerelles gratuites ne servent que `/v1/messages`, plus le
+Attendu. Les fournisseurs gratuits ne servent que `/v1/messages`, plus le
 comptage de jetons estimé localement. Le reste de l'API n'existe pas chez
 elles.
 

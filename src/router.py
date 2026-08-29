@@ -10,12 +10,14 @@ decide *a chaque requete* ou l'envoyer :
 
   mode natif    -> https://api.anthropic.com, avec le jeton OAuth du compte
                    actif (lu dans le trousseau macOS de Claude Code)
-  mode fcc      -> proxy Free Claude Code local (127.0.0.1:8082), qui parle
-                   l'API Anthropic et couvre une cinquantaine de
-                   fournisseurs gratuits
-  mode zen/kilo -> passerelles OpenAI-compatibles, traduites par `bridge.py`
-  mode or       -> https://openrouter.ai/api/v1, seul amont a parler l'API
+  mode <fournisseur> -> une des passerelles du registre (providers.py) :
+                   API OpenAI, traduite par `bridge.py`. Le registre porte
+                   une quarantaine de fournisseurs, tient son catalogue de
+                   modeles et deduit lui-meme le modele de chaque palier.
+  mode or       -> https://openrouter.ai/api/v1, amont qui parle l'API
                    Anthropic nativement (/v1/messages, SSE, tool_use)
+  mode fcc      -> proxy Free Claude Code local (127.0.0.1:8082), s'il
+                   tourne : un maillon de plus, jamais une dependance
 
 Plusieurs comptes Claude peuvent etre enregistres : sur un 429, le routeur
 essaie d'abord le compte suivant qui n'est pas en repos, et ce n'est qu'une
@@ -59,6 +61,7 @@ HOME = os.path.expanduser("~")
 # Le pont vit a cote de ce fichier, ou qu'on l'ait installe.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge  # noqa: E402  (le chemin doit etre pose avant l'import)
+import providers  # noqa: E402
 import statefile  # noqa: E402
 
 DBL_DIR = os.path.join(HOME, ".doublure")
@@ -70,12 +73,11 @@ LEGACY_STATE = (os.path.join(HOME, ".claude", "fcc-fallback.json"),
 UPSTREAM_NATIVE = ("api.anthropic.com", 443, True)
 UPSTREAM_OR = ("openrouter.ai", 443, True)
 
-# Free Claude Code, installe en local (http://127.0.0.1:8082). Il parle
-# l'API Anthropic nativement et porte a lui seul une cinquantaine de
-# fournisseurs (NVIDIA NIM, OpenRouter, Groq, Cerebras, Ollama...), avec sa
-# propre chaine de repli et son suivi de sante des modeles. Tenir a jour
-# une table de modeles gratuits n'est donc plus notre affaire : ce repli
-# passe devant nos passerelles ecrites a la main.
+# Free Claude Code, s'il est installe en local (http://127.0.0.1:8082). Il
+# parle l'API Anthropic nativement. Doublure porte desormais son propre
+# registre de fournisseurs (providers.py) : FCC n'est plus qu'un maillon
+# supplementaire, essaye s'il ecoute, retire sans bruit sinon. Rien ici n'en
+# depend.
 FCC_PORT = int(os.environ.get("FCC_PORT", "8082"))
 UPSTREAM_FCC = ("127.0.0.1", FCC_PORT, False)
 FCC_ENV = os.path.join(HOME, ".fcc", ".env")
@@ -85,73 +87,75 @@ FCC_TOKEN = "doublure"
 
 # OpenRouter sert l'API Anthropic sous /api/v1 ; Claude Code appelle /v1.
 OR_PREFIX = "/api"
-ENV_FILE = os.path.join(DBL_DIR, ".env")
-LEGACY_ENV = (os.path.join(HOME, ".fcc", ".env"),)
+# Les cles vivent dans ~/.doublure/.env, resolues par providers.py — qui lit
+# aussi celui de FCC, en lecture seule, pour ne pas redemander ce qui est deja
+# pose la.
 
 # Reecriture obligatoire du nom de modele : laisse tel quel, « claude-opus-5 »
 # est route par OpenRouter vers le VRAI Anthropic et facture au credit. Le
-# repli doit rester gratuit, donc chaque alias Claude Code est traduit vers un
-# modele « :free ». Sonde du 2026-08-22 : ces trois-la passent streaming,
-# tool_use, aller-retour tool_result et un contexte de 28k.
-OR_MODELS = {
-    "opus":   "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "sonnet": "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "fable":  "nvidia/nemotron-3.5-lightning:free",
-    "haiku":  "nvidia/nemotron-3-nano-30b-a3b:free",
-}
-OR_DEFAULT = OR_MODELS["sonnet"]
+# repli doit rester gratuit, donc chaque alias Claude Code est traduit. La
+# table n'est plus ecrite ici : elle vient du registre, qui deduit le modele
+# de chaque palier du catalogue reellement servi (providers.tiers).
 
 # --------------------------------------------------------------------------
-# Passerelles gratuites parlant OpenAI : opencode Zen et Kilo
+# Passerelles parlant OpenAI : le registre
 # --------------------------------------------------------------------------
-# OpenRouter sert l'API Anthropic telle quelle, ces deux-la non : elles n'ont
-# que /chat/completions. Le module oai_bridge traduit requete, reponse et flux
-# SSE, de sorte que la session Claude Code ne voie aucune difference.
+# OpenRouter sert l'API Anthropic telle quelle ; les autres non : elles n'ont
+# que /chat/completions. `bridge.py` traduit requete, reponse et flux SSE, de
+# sorte que la session Claude Code ne voie aucune difference.
 #
-# Ni l'une ni l'autre ne demande de cle : le repli reste disponible meme quand
-# le quota OpenRouter (50 req/jour sous 10 credits) est epuise.
-#
-# Modeles retenus le 2026-08-22 apres sonde sur les cinq usages reels de
-# Claude Code — texte, streaming, tool_use, aller-retour tool_result,
-# contexte de 30k. Seuls les 5/5 figurent ici.
-BRIDGES = {
-    "zen": {
-        "label": "opencode Zen",
-        "host": "opencode.ai", "port": 443, "tls": True,
-        "path": "/zen/v1/chat/completions",
-        "models": {
-            "opus":   "nemotron-3-ultra-free",
-            "sonnet": "nemotron-3-ultra-free",
-            "fable":  "nemotron-3.5-lightning-free",
-            "haiku":  "nemotron-3.5-lightning-free",
-        },
-    },
-    "kilo": {
-        "label": "Kilo",
-        "host": "api.kilo.ai", "port": 443, "tls": True,
-        "path": "/api/gateway/v1/chat/completions",
-        "models": {
-            "opus":   "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "sonnet": "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "fable":  "nvidia/nemotron-3-super-120b-a12b:free",
-            "haiku":  "nvidia/nemotron-3.5-lightning:free",
-        },
-    },
+# La liste n'est plus ecrite ici. `providers.py` porte le registre — une
+# quarantaine de fournisseurs, leurs bases, leurs cles, leurs ecarts de
+# dialecte — et deduit le modele de chaque palier du catalogue que le
+# fournisseur annonce vraiment. Ajouter une cle dans ~/.doublure/.env suffit
+# a faire entrer un fournisseur dans la chaine ; il n'y a rien a coder.
+
+# Noms courts historiques. `dbl on zen` doit continuer de marcher : c'est le
+# nom que la documentation et l'habitude connaissent. OpenRouter, lui, est
+# ramene sur le mode « or » : il parle l'API Anthropic nativement, ce qui est
+# plus fidele que de passer par la traduction.
+ALIASES = {
+    "zen": "opencode_zen", "go": "opencode_go", "nim": "nvidia_nim",
+    "open_router": "or", "openrouter": "or",
 }
 
-MODES = ("native", "fcc", "or", "zen", "kilo")
-# Ordre d'essai des replis quand le natif tombe sur un 429. FCC d'abord :
-# c'est le seul dont le catalogue est entretenu ailleurs qu'ici, et il
-# reessaie lui-meme chez un autre fournisseur avant de rendre un echec.
-# Viennent ensuite les deux passerelles sans cle, puis OpenRouter dont le
-# quota journalier s'epuise en une session.
-DEFAULT_CHAIN = ("fcc", "zen", "kilo", "or")
+
+def resolve(mode):
+    """Nom court -> identifiant du registre."""
+    return ALIASES.get(mode, mode) if isinstance(mode, str) else mode
+
+
+def modes():
+    """Modes acceptables. Calcule, pas fige : une cle ajoutee suffit."""
+    return ("native", "fcc", "or") + tuple(providers.PREFERENCE)
+
+
+def mode_ok(mode):
+    return isinstance(mode, str) and resolve(mode) in modes()
+
+
+def is_bridged(mode):
+    """Ce mode passe-t-il par la traduction OpenAI ?"""
+    return mode in providers.CATALOG and providers.usable(mode)
+
+
+def bridge_cfg(mode):
+    """Ou et comment joindre une passerelle du registre."""
+    host, port, tls, _prefix = providers.endpoint(mode)
+    return {"label": providers.label(mode), "host": host, "port": port,
+            "tls": tls, "path": providers.chat_path(mode)}
+
+
+# Ordre d'essai des replis quand le natif tombe sur un 429. Il n'est plus
+# ecrit a la main : c'est l'ordre de preference du registre, restreint aux
+# fournisseurs joignables. FCC est place en queue — utile s'il tourne,
+# jamais necessaire.
 # Delai de repli quand l'amont n'annonce pas lui-meme son echeance.
 RETRY_NATIVE_DEFAULT = 30 * 60
 
-# Cloudflare refuse « Python-urllib » en amont : un agent explicite evite un
-# 403 qui n'a rien a voir avec la requete elle-meme.
-BRIDGE_UA = "doublure/1.0"
+# Rafraichissement des catalogues de modeles, en fond. Une demi-heure : un
+# fournisseur ajoute ou retire un modele en jours, pas en minutes.
+CATALOG_POLL = 30 * 60
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 # Comptes Claude supplementaires. Le fichier ne contient que des metadonnees
@@ -188,6 +192,12 @@ OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 # On rafraichit avant l'echeance : une requete ne doit jamais partir avec un
 # jeton qui expire pendant son vol.
 REFRESH_MARGIN = 300
+# Repos d'un compte dont le jeton vient d'etre refuse (401). Court : le
+# compte n'est pas epuise, il attend qu'un couple OAuth valide soit ecrit
+# dans le trousseau par un autre detenteur (claude-swap, un run Atelier).
+# Plus long, il ferait travailler la session en repli gratuit alors que le
+# vrai Opus est redevenu joignable.
+AUTH_REST = 120
 
 # En-tetes qui decrivent *ce lien-ci* et non le message : ne jamais relayer.
 HOP_BY_HOP = {
@@ -259,11 +269,13 @@ def current_mode():
                 data = json.load(fh)
         except (OSError, ValueError):
             continue
-        if isinstance(data, dict) and data.get("mode") in MODES:
+        if isinstance(data, dict) and mode_ok(data.get("mode")):
             # « fcc » designait autrefois OpenRouter ; il designe desormais
             # le proxy Free Claude Code local, meilleur repli que lui — un
-            # etat ancien pointe donc au bon endroit sans traduction.
-            mode = data["mode"]
+            # etat ancien pointe donc au bon endroit sans traduction. Les
+            # anciens noms courts (« zen », « nim ») sont traduits ici, une
+            # fois : le reste du routeur ne connait que les ids du registre.
+            mode = resolve(data["mode"])
             break
     with _state_lock:
         _state_cache.update(at=now, mode=mode)
@@ -358,18 +370,59 @@ def fcc_models():
 
 
 def chain():
-    """Ordre des replis a essayer. Sans cle, OpenRouter est ecarte.
+    """Ordre des replis a essayer, du plus prometteur au dernier recours.
 
-    Le tenter sans cle donnerait un 401 presente au client comme une panne du
-    repli, alors que les deux autres passerelles auraient repondu.
+    Deduit du registre : les fournisseurs joignables (cle presente, ou qui
+    servent sans cle), dans l'ordre de preference. Un ordre fixe dans l'etat
+    par l'utilisateur gagne sur le defaut.
+
+    Un fournisseur sans cle est ecarte plutot que tente : son 401 serait
+    presente au client comme une panne du repli, alors que le suivant aurait
+    repondu.
     """
-    order = read_state().get("chain") or list(DEFAULT_CHAIN)
-    order = [p for p in order if p in MODES and p != "native"]
-    if not or_key():
-        order = [p for p in order if p != "or"]
-    if not fcc_up():
-        order = [p for p in order if p != "fcc"]
-    return order or ["zen"]
+    order = read_state().get("chain")
+    if order and isinstance(order, list):
+        order = [resolve(p) for p in order if isinstance(p, str)]
+    else:
+        order = [resolve(p) for p in providers.configured()] + ["fcc"]
+    out, seen = [], set()
+    for prov in order:
+        if prov in seen or prov == "native":
+            continue
+        seen.add(prov)
+        if prov == "fcc":
+            if fcc_up():
+                out.append(prov)
+        elif prov == "or":
+            if or_key():
+                out.append(prov)
+        elif is_bridged(prov) and (providers.key(prov)
+                                   or providers.keyless(prov)):
+            out.append(prov)
+    return out or ["opencode_zen"]
+
+
+def provider_rows():
+    """Etat du registre, pour la sonde /__router et le CLI.
+
+    Les cles ne sortent jamais d'ici — seulement le fait qu'il y en ait une.
+    """
+    live = set(chain())
+    rows = []
+    for prov in providers.PREFERENCE:
+        if not providers.usable(prov):
+            continue
+        name = resolve(prov)
+        cfg = providers.CATALOG[prov]
+        rows.append({
+            "id": name, "label": providers.label(prov),
+            "hasKey": bool(providers.key(prov)),
+            "keyless": providers.keyless(prov),
+            "local": bool(cfg.get("local")),
+            "inChain": name in live,
+            "resting": provider_resting(name),
+        })
+    return rows
 
 
 def retry_after(resp):
@@ -392,6 +445,25 @@ def retry_after(resp):
         except ValueError:
             pass
     return time.time() + RETRY_NATIVE_DEFAULT
+
+
+def catalog_watch():
+    """Tient les catalogues de modeles chauds, en fond.
+
+    Sans ce fil, la premiere requete de repli paierait le listage HTTP du
+    fournisseur avant de pouvoir choisir un modele — quelques centaines de
+    millisecondes, parfois plus si l'amont traine. Ici c'est fait a l'avance,
+    hors du chemin des requetes, et le cache disque tient six heures.
+    """
+    while True:
+        try:
+            for prov in providers.configured():
+                if resolve(prov) in ("or", "native"):
+                    continue      # servis en API Anthropic, aucun listage
+                providers.models(prov)
+        except Exception as e:
+            log(f"catalogue: {type(e).__name__}: {e}")
+        time.sleep(CATALOG_POLL)
 
 
 def watchdog():
@@ -644,6 +716,13 @@ def all_accounts():
         out.append(acc)
     for acc in read_accounts():
         key = (acc["service"], acc.get("swapAccount"))
+        if acc["service"] == SWAP_SERVICE and key not in seen:
+            # Ligne laissee par un repos sur un slot que claude-swap ne
+            # propose plus : compte retire, ou doublon du compte de la session
+            # ecarte plus haut. La garder le ferait revenir comme un compte a
+            # part entiere, et c'est precisement le doublon qu'on vient de
+            # supprimer.
+            continue
         if key in seen or acc["name"] in names:
             # Le compte de la session a lui aussi un repos memorise : le
             # perdre ici le ferait reessayer en boucle sur son 429.
@@ -704,6 +783,13 @@ def swap_accounts():
     # comme un compte de plus brule dans le journal.
     session = ((read_keychain() or {}).get("claudeAiOauth")
                or {}).get("refreshToken")
+    # Le jeton de rafraichissement tourne a chaque renouvellement : des que
+    # l'un des deux exemplaires se rafraichit, la comparaison ci-dessus ne
+    # reconnait plus le doublon et le meme abonnement repart en deux comptes.
+    # Chacun rafraichit alors le couple de l'autre, ce qui le revoque — c'est
+    # la boucle de 401 « please run /login » que la session ne pouvait pas
+    # reparer. On retient donc le slot une fois pour toutes.
+    known = str(read_state().get("sessionSlot") or "")
     for slot in sorted(slots, key=lambda s: (len(s), s)):
         info = slots[slot] if isinstance(slots[slot], dict) else {}
         email = info.get("email")
@@ -718,6 +804,13 @@ def swap_accounts():
             # apparaitraient comme des comptes disponibles dans `dbl`.
             continue
         if session and oauth.get("refreshToken") == session:
+            if slot != known:
+                update_state(sessionSlot=slot)
+            continue
+        if slot == known:
+            # Meme abonnement que la session, reconnu avant que les deux
+            # exemplaires ne divergent. Le tenter serait tenter le compte de
+            # la session une seconde fois, sous un autre nom.
             continue
         out.append({
             "name": "swap%s" % slot,
@@ -802,6 +895,18 @@ def next_account(exclude, now=None):
     return None
 
 
+def _drop(conn, resp):
+    """Vide et ferme une reponse amont qu'on ne renverra pas au client."""
+    try:
+        resp.read()
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 def refresh_token(refresh):
     cid = client_id()
     if not cid:
@@ -823,21 +928,27 @@ def refresh_token(refresh):
         return json.loads(r.read().decode())
 
 
-def access_token(service=KEYCHAIN_SERVICE, account=None):
+def access_token(service=KEYCHAIN_SERVICE, account=None, fresh=False):
     """Jeton d'un compte, rafraichi si son echeance approche.
 
     Le cache est indexe par (service, entree) : les comptes de claude-swap
     partagent un service, et un cache par service seul leur ferait voler leur
     jeton l'un a l'autre.
+
+    `fresh` saute le cache et force le rafraichissement quelle que soit
+    l'echeance annoncee : c'est la reponse a un 401. Un jeton revoque cote
+    Anthropic garde une echeance lointaine, seul un couple neuf passe. Rend
+    None plutot qu'un jeton dont on sait deja qu'il sera refuse.
     """
     now = time.time()
     key = (service, account)
-    with _token_lock:
-        entry = _token_cache.get(key) or {}
-        # Cache court : le compte connecte peut changer a tout moment, on
-        # veut le voir vite, mais pas relire le trousseau a chaque requete.
-        if entry.get("token") and now - entry.get("at", 0) < 5:
-            return entry["token"]
+    if not fresh:
+        with _token_lock:
+            entry = _token_cache.get(key) or {}
+            # Cache court : le compte connecte peut changer a tout moment, on
+            # veut le voir vite, mais pas relire le trousseau a chaque requete.
+            if entry.get("token") and now - entry.get("at", 0) < 5:
+                return entry["token"]
 
     blob = read_keychain(service, account)
     if not blob:
@@ -846,14 +957,36 @@ def access_token(service=KEYCHAIN_SERVICE, account=None):
     token = oauth.get("accessToken")
     expires = (oauth.get("expiresAt") or 0) / 1000.0
 
-    if token and expires and expires - now < REFRESH_MARGIN:
+    if token and (fresh or (expires and expires - now < REFRESH_MARGIN)):
         refresh = oauth.get("refreshToken")
         if refresh:
             try:
                 data = refresh_token(refresh)
             except Exception as e:
-                log(f"rafraichissement impossible ({type(e).__name__}) — "
-                    f"on tente le jeton en place")
+                # Le couple OAuth a ete tourne par un autre detenteur du meme
+                # compte — claude-swap, un run Atelier, une session `claude`
+                # lancee a cote. Le notre est mort, mais le sien vient d'etre
+                # ecrit dans le trousseau : on relit une fois avant de rendre
+                # les armes.
+                other = ((read_keychain(service, account) or {})
+                         .get("claudeAiOauth") or {})
+                if other.get("accessToken") \
+                        and other["accessToken"] != token:
+                    token = other["accessToken"]
+                    expires = (other.get("expiresAt") or 0) / 1000.0
+                    log(f"rafraichissement impossible ({type(e).__name__}) — "
+                        f"jeton repris du trousseau ({account or service})")
+                elif fresh:
+                    # Appele apres un 401 : le jeton en place vient justement
+                    # d'etre refuse, le reservir ne ferait qu'un 401 de plus.
+                    log(f"rafraichissement impossible ({type(e).__name__}) — "
+                        f"plus de jeton valide pour « {account or service} »")
+                    with _token_lock:
+                        _token_cache.pop(key, None)
+                    return None
+                else:
+                    log(f"rafraichissement impossible ({type(e).__name__}) — "
+                        f"on tente le jeton en place")
             else:
                 token = data.get("access_token") or token
                 oauth["accessToken"] = token
@@ -894,7 +1027,7 @@ def fetch_usage(service, account=None):
     req = urllib.request.Request(USAGE_URL, headers={
         "Authorization": f"Bearer {token}",
         "anthropic-beta": USAGE_BETA,
-        "User-Agent": BRIDGE_UA,
+        "User-Agent": providers.UA,
     })
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -1024,28 +1157,13 @@ def usage_watch():
 # OpenRouter : cle, nom de modele, corps de requete
 # --------------------------------------------------------------------------
 
-_or_key_cache = {"at": 0.0, "key": None}
-
-
 def or_key():
-    """Cle OpenRouter, lue dans le .env de l'installation, gardee 60 s."""
-    now = time.time()
-    if _or_key_cache["key"] and now - _or_key_cache["at"] < 60:
-        return _or_key_cache["key"]
-    key = os.environ.get("OPENROUTER_API_KEY")
-    for path in ((ENV_FILE,) + LEGACY_ENV) if not key else ():
-        try:
-            with open(path) as fh:
-                for line in fh:
-                    if line.startswith("OPENROUTER_API_KEY="):
-                        key = line.split("=", 1)[1].strip().strip("\"'")
-                        break
-        except OSError:
-            continue
-        if key:
-            break
-    _or_key_cache.update(at=now, key=key or None)
-    return key or None
+    """Cle OpenRouter — le registre la resout, ici on garde juste le nom court.
+
+    Une seule resolution pour tout le monde : environnement, puis
+    ~/.doublure/.env, puis le .env de FCC en dernier ressort.
+    """
+    return providers.key("open_router")
 
 
 # --------------------------------------------------------------------------
@@ -1095,14 +1213,10 @@ def or_model(name):
     lieu d'en economiser. Un nom qui contient deja « / » est un identifiant
     OpenRouter explicite, on le laisse passer.
     """
-    table = table_for("or", OR_MODELS)
     if not isinstance(name, str) or "/" in name:
         return name
-    low = name.lower()
-    for alias, target in table.items():
-        if alias in low:
-            return target
-    return table["sonnet"]
+    return (providers.pick("open_router", name, overrides().get("or"))
+            or name)
 
 
 def or_body(body):
@@ -1145,22 +1259,17 @@ def or_body(body):
 # --------------------------------------------------------------------------
 
 def bridge_model(mode, name):
-    """Alias Claude Code -> modele gratuit de la passerelle.
+    """Alias Claude Code -> modele du fournisseur, via le registre.
 
     Meme garde-fou que pour OpenRouter : un nom « claude-* » laisse tel quel
-    serait au mieux inconnu, au pire facture. On ne laisse passer un nom brut
-    que s'il figure deja au catalogue de la passerelle.
+    serait au mieux inconnu, au pire facture. Le registre ne laisse passer un
+    nom brut que s'il figure deja au catalogue du fournisseur.
+
+    Rend None si le fournisseur n'annonce aucun modele exploitable — c'est le
+    cas d'un serveur local allume mais vide. L'appelant passe alors au
+    suivant plutot que d'envoyer un nom vide en amont.
     """
-    table = table_for(mode, BRIDGES[mode]["models"])
-    if not isinstance(name, str):
-        return table["sonnet"]
-    if name in table.values():
-        return name
-    low = name.lower()
-    for alias, target in table.items():
-        if alias in low:
-            return target
-    return table["sonnet"]
+    return providers.pick(mode, name, overrides().get(mode))
 
 
 # --------------------------------------------------------------------------
@@ -1216,7 +1325,7 @@ class Router(http.server.BaseHTTPRequestHandler):
         l'appelant qui essaiera la passerelle suivante, et le message de
         l'utilisateur n'est pas perdu pour autant.
         """
-        cfg = BRIDGES[mode]
+        cfg = bridge_cfg(mode)
 
         try:
             data = json.loads(body) if body else {}
@@ -1247,16 +1356,38 @@ class Router(http.server.BaseHTTPRequestHandler):
             return True, None
 
         model = bridge_model(mode, data.get("model"))
+        if not model:
+            # Fournisseur joignable mais sans catalogue exploitable : un
+            # serveur local allume et vide, ou un listage qui ne repond pas.
+            # Le tenter enverrait un nom de modele vide.
+            err = {"status": 503, "rest": PROVIDER_REST,
+                   "detail": f"{cfg['label']} n'annonce aucun modele utilisable"}
+            if cascade:
+                return False, err
+            self.local(503, {"type": "error", "error": {
+                "type": "router_error", "message": err["detail"]}})
+            return True, None
+
         stream = bool(data.get("stream"))
         payload = json.dumps(bridge.to_openai(data, model)).encode()
+        # Ecarts de dialecte du fournisseur : champ de longueur maximale,
+        # plancher exige, champs refuses. Sans ca, une requete par ailleurs
+        # correcte se fait refuser par un fournisseur sur six.
+        payload = providers.chat_body(mode, payload)
 
         headers = {
             "Content-Type": "application/json",
             "Content-Length": str(len(payload)),
-            "User-Agent": BRIDGE_UA,
+            "User-Agent": providers.ua(mode),
             "Accept": "text/event-stream" if stream else "application/json",
-            "Host": cfg["host"],
+            "Host": cfg["host"] if cfg["port"] in (80, 443)
+                    else "%s:%d" % (cfg["host"], cfg["port"]),
         }
+        # La plupart des fournisseurs veulent un porteur ; les trois locaux
+        # une chaine fixe ; deux passerelles rien du tout.
+        tok = providers.key(mode)
+        if tok:
+            headers["Authorization"] = "Bearer " + tok
 
         cls = http.client.HTTPSConnection if cfg["tls"] else http.client.HTTPConnection
         try:
@@ -1337,7 +1468,7 @@ class Router(http.server.BaseHTTPRequestHandler):
 
         OpenRouter et le proxy Free Claude Code sont dans ce cas — aucune
         traduction OpenAI a faire, contrairement aux passerelles de
-        BRIDGES. Meme contrat que bridged() : (servi, echec), et rien n'est
+        registre. Meme contrat que bridged() : (servi, echec), et rien n'est
         rendu au client sur un echec — l'appelant essaie le suivant.
         """
         label = "Free Claude Code" if prov == "fcc" else "OpenRouter"
@@ -1376,7 +1507,7 @@ class Router(http.server.BaseHTTPRequestHandler):
             live = list(order)
         first = None
         for prov in live:
-            if prov in BRIDGES:
+            if is_bridged(prov):
                 served, err = self.bridged(prov, path, body, cascade=True)
             else:
                 served, err = self.api_served(prov, path, body)
@@ -1436,16 +1567,19 @@ class Router(http.server.BaseHTTPRequestHandler):
                     "accounts": accounts,
                     "hasToken": bool(access_token(acc["service"],
                                                   acc.get("swapAccount"))),
+                    "providers": provider_rows(),
                 })
-            if mode in BRIDGES:
-                cfg = BRIDGES[mode]
+            if is_bridged(mode):
+                cfg = bridge_cfg(mode)
                 return self.local(200, {
                     "mode": mode,
                     "label": cfg["label"],
                     "upstream": cfg["host"] + cfg["path"],
                     "accounts": accounts,
-                    "hasToken": True,     # ces passerelles n'exigent pas de cle
-                    "models": cfg["models"],
+                    "hasToken": bool(providers.key(mode))
+                                or providers.keyless(mode),
+                    "models": providers.tiers(mode, overrides().get(mode)),
+                    "providers": provider_rows(),
                 })
             if mode == "fcc":
                 return self.local(200, {
@@ -1455,6 +1589,7 @@ class Router(http.server.BaseHTTPRequestHandler):
                     "accounts": accounts,
                     "hasToken": fcc_up(),
                     "models": fcc_models(),
+                    "providers": provider_rows(),
                 })
             return self.local(200, {
                 "mode": mode,
@@ -1462,8 +1597,28 @@ class Router(http.server.BaseHTTPRequestHandler):
                 "upstream": "openrouter.ai/api/v1",
                 "accounts": accounts,
                 "hasToken": bool(or_key()),
-                "models": OR_MODELS,
+                "models": providers.tiers("open_router",
+                                          overrides().get("or")),
+                "providers": provider_rows(),
             })
+
+        # Quota affiche par Claude Code (« 5h — % / 7j — % »). Le client
+        # interroge ce point d'entree a travers nous : sans reponse il tombe
+        # dans la chaine de repli, ou aucun fournisseur ne sait le servir, et
+        # l'indicateur reste vide. On le sert depuis le compte natif actif,
+        # dont le releve est deja tenu a jour par la sonde de fond.
+        if path == "/api/oauth/usage":
+            acc = active_account()
+            data = usage_snapshot(acc["service"], acc.get("swapAccount"))
+            if data is None:
+                data = fetch_usage(acc["service"], acc.get("swapAccount"))
+            if data is None:
+                log("usage: aucun releve disponible")
+                return self.local(503, {"type": "error", "error": {
+                    "type": "router_error",
+                    "message": "releve de quota indisponible"}})
+            log(f"usage servi depuis « {acc['name']} »")
+            return self.local(200, data)
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -1517,22 +1672,40 @@ class Router(http.server.BaseHTTPRequestHandler):
         if err:
             return                       # l'erreur a deja ete rendue au client
 
-        # Quota Claude atteint. C'est le seul endroit ou le repli peut se
-        # prendre sans rien perdre : aucun octet n'est encore parti vers le
-        # client, donc la meme requete repart ailleurs et le message de
-        # l'utilisateur arrive quand meme. Une fois le SSE commence, il est
-        # trop tard — on ne rejoue plus, on laisse passer l'erreur.
-        if resp.status != 429:
+        # Jeton refuse. Laisser passer ce 401 afficherait « Please run /login »
+        # dans la session, et /login n'y peut rien : depuis qu'elle passe par
+        # nous, la session ne porte plus son propre jeton. On force donc un
+        # couple neuf et on rejoue une fois — rien n'est encore parti vers le
+        # client, la requete est rejouable telle quelle.
+        if resp.status == 401:
+            _drop(conn, resp)
+            log(f"401 sur le compte « {account['name']} » — jeton revoque, "
+                f"on en redemande un")
+            if access_token(account["service"], account.get("swapAccount"),
+                            fresh=True):
+                conn, resp, err = self.direct("native", body, account)
+                if err:
+                    return
+            else:
+                conn, resp = None, None
+
+        # Quota atteint, ou jeton toujours refuse. C'est le seul endroit ou le
+        # repli peut se prendre sans rien perdre : aucun octet n'est encore
+        # parti vers le client, donc la meme requete repart ailleurs et le
+        # message de l'utilisateur arrive quand meme. Une fois le SSE commence,
+        # il est trop tard — on ne rejoue plus, on laisse passer l'erreur.
+        if resp is not None and resp.status not in (401, 429):
             return self.stream("native", path, conn, resp)
 
-        due = retry_after(resp)
-        try:
-            resp.read()
-        except Exception:
-            pass
-        conn.close()
+        if resp is None:
+            status, due = 401, time.time() + AUTH_REST
+        else:
+            status = resp.status
+            due = (retry_after(resp) if status == 429
+                   else time.time() + AUTH_REST)
+            _drop(conn, resp)
         rest_account(account["name"], due, account)
-        log(f"429 sur le compte « {account['name']} » — repos "
+        log(f"{status} sur le compte « {account['name']} » — repos "
             f"{max(1, round((due - time.time()) / 60))} min")
 
         # Une seule requete mene la rotation. Claude Code en emet plusieurs en
@@ -1561,13 +1734,14 @@ class Router(http.server.BaseHTTPRequestHandler):
                 conn, resp, err = self.direct("native", body, nxt)
                 if err:
                     return
-                if resp.status != 429:
+                if resp.status not in (401, 429):
                     # Le verrou tombe avant de streamer : une generation dure
                     # des minutes, et rien ne doit attendre derriere.
                     _switch_lock.release()
                     held = False
                     return self.stream("native", path, conn, resp)
-                nxt_due = retry_after(resp)
+                nxt_due = (retry_after(resp) if resp.status == 429
+                           else time.time() + AUTH_REST)
                 try:
                     resp.read()
                 except Exception:
@@ -1576,12 +1750,14 @@ class Router(http.server.BaseHTTPRequestHandler):
                 rest_account(nxt["name"], nxt_due, nxt)
                 due = min(due, nxt_due)
                 tried.add(nxt["name"])
-                log(f"429 aussi sur « {nxt['name']} »")
+                log(f"{resp.status} aussi sur « {nxt['name']} »")
 
             # Tous les comptes sont au repos : c'est maintenant que le
             # gratuit sert a quelque chose. La date de retour est celle du
             # premier compte a se liberer.
-            set_mode(chain()[0], "auto: quota Claude atteint", due)
+            set_mode(chain()[0],
+                     "auto: jeton Claude refuse" if status == 401
+                     else "auto: quota Claude atteint", due)
             log(f"tous les comptes epuises -> repli {chain()[0]}, natif "
                 f"retente dans {max(1, round((due - time.time()) / 60))} min")
         finally:
@@ -1762,6 +1938,7 @@ def main():
         sys.exit(f"port {PORT} indisponible : {e}")
     threading.Thread(target=watchdog, daemon=True).start()
     threading.Thread(target=usage_watch, daemon=True).start()
+    threading.Thread(target=catalog_watch, daemon=True).start()
     log(f"routeur pret sur http://{HOST}:{PORT} (mode {current_mode()})")
     try:
         srv.serve_forever()
